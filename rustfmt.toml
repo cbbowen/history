@@ -1,0 +1,3 @@
+edition = "2021"
+wrap_comments = true
+comment_width = 100  # Match `max_width`.
