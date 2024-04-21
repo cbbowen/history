@@ -16,8 +16,9 @@ pub trait Action {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(usize);
 
+/// The only error type used by this library.
 #[derive(Error, Debug, PartialEq, Eq)]
-pub enum HistoryError {
+pub enum Error {
     #[error("version out of range")]
     VersionOutOfRange(Version),
 }
@@ -40,6 +41,19 @@ where
 
 impl<A: Action> History<A> {
     /// Constructs a new history with the given initial state.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # struct NoOp;
+    /// # impl Action for NoOp {
+    /// #  type State = i32;
+    /// #  fn apply(&self, state: i32) -> i32 { state }
+    /// # }
+    /// let history = History::<NoOp>::new(42);
+    /// assert_eq!(*history.current_state(), 42);
+    /// ```
     pub fn new(initial: A::State) -> Self {
         Self {
             actions: Vec::new(),
@@ -63,7 +77,6 @@ impl<A: Action> History<A> {
     ///
     /// ```
     /// # use history::*;
-    /// # #[derive(Debug, PartialEq, Eq)]
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
@@ -154,15 +167,19 @@ impl<A: Action> History<A> {
 
     /// Returns the most recent cached state not after the given `version` or an error if no such
     /// cached state exists.
-    fn get_recent_state_index(&self, version: Version) -> Result<usize, HistoryError> {
+    fn get_recent_state_index(&self, version: Version) -> Result<usize, Error> {
         if version > self.current_version() {
-            return Err(HistoryError::VersionOutOfRange(version));
+            return Err(Error::VersionOutOfRange(version));
         }
         let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
         Ok(index)
     }
 
     /// Returns the state at the current version.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) time.
     pub fn current_state(&self) -> &A::State {
         let (version, state) = self.states.last().unwrap();
         debug_assert_eq!(*version, self.current_version());
@@ -170,7 +187,7 @@ impl<A: Action> History<A> {
     }
 
     /// Returns the state at the specified version.
-    pub fn get_state(&self, version: Version) -> Result<A::State, HistoryError> {
+    pub fn get_state(&self, version: Version) -> Result<A::State, Error> {
         let state_index = self.get_recent_state_index(version)?;
         let (recent_version, state) = self.get_cached_state(state_index);
         Ok(self.actions[recent_version.0..version.0]
@@ -267,6 +284,10 @@ mod tests {
              prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
+        fn current_version(history: History<TestAction>) {
+            prop_assert_eq!(Some(history.current_version()), history.versions().last());
+        }
+
         #[test]
         fn get_state(history: History<TestAction>) {
              let mut state = Default::default();
@@ -286,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn example() {
+    fn how_it_works() {
         let mut history = History::default();
         println!("{:?}", history.cached_versions());
 
