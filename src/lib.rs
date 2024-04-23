@@ -52,7 +52,7 @@ impl<A: Action> History<A> {
     /// #  fn apply(&self, state: i32) -> i32 { state }
     /// # }
     /// let history = History::<NoOp>::new(42);
-    /// assert_eq!(*history.current_state(), 42);
+    /// assert_eq!(*history.last_state(), 42);
     /// ```
     pub fn new(initial: A::State) -> Self {
         Self {
@@ -83,17 +83,17 @@ impl<A: Action> History<A> {
     /// #  fn apply(&self, state: i32) -> i32 { self.0 + state }
     /// # }
     /// # let mut history = History::default();
-    /// let before = *history.current_state();
-    /// assert_eq!(*history.current_state(), 0);
+    /// let before = *history.last_state();
+    /// assert_eq!(*history.last_state(), 0);
     /// history.push_action(Add(42));
-    /// assert_eq!(*history.current_state(), 42);
+    /// assert_eq!(*history.last_state(), 42);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
     pub fn push_action(&mut self, action: A) -> Version {
-        let new_state = action.apply(self.current_state().clone());
+        let new_state = action.apply(self.last_state().clone());
         self.actions.push(action);
         let new_version = Version(self.actions.len());
 
@@ -124,11 +124,11 @@ impl<A: Action> History<A> {
     /// #  fn apply(&self, state: i32) -> i32 { self.0 + state }
     /// # }
     /// # let mut history = History::default();
-    /// let before = *history.current_state();
+    /// let before = *history.last_state();
     /// history.push_action(Add(42));
-    /// assert_eq!(*history.current_state(), 42);
+    /// assert_eq!(*history.last_state(), 42);
     /// assert_eq!(history.pop_action(), Some(Add(42)));
-    /// assert_eq!(*history.current_state(), 0);
+    /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
@@ -155,8 +155,8 @@ impl<A: Action> History<A> {
         Some(action)
     }
 
-    /// Returns the current version.
-    pub fn current_version(&self) -> Version {
+    /// Returns the most recent version.
+    pub fn last_version(&self) -> Version {
         Version(self.actions.len())
     }
 
@@ -168,21 +168,21 @@ impl<A: Action> History<A> {
     /// Returns the most recent cached state not after the given `version` or an error if no such
     /// cached state exists.
     fn get_recent_state_index(&self, version: Version) -> Result<usize, Error> {
-        if version > self.current_version() {
+        if version > self.last_version() {
             return Err(Error::VersionOutOfRange(version));
         }
         let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
         Ok(index)
     }
 
-    /// Returns the state at the current version.
+    /// Returns the most recent state.
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) time.
-    pub fn current_state(&self) -> &A::State {
+    pub fn last_state(&self) -> &A::State {
         let (version, state) = self.states.last().unwrap();
-        debug_assert_eq!(*version, self.current_version());
+        debug_assert_eq!(*version, self.last_version());
         state
     }
 
@@ -261,31 +261,31 @@ mod tests {
     proptest! {
         #[test]
         fn push_action(mut history: History<TestAction>, action: TestAction) {
-             let previous_version = history.current_version();
+             let previous_version = history.last_version();
              let mut actions = Vec::from_iter(history.actions().cloned());
              let new_version = history.push_action(action.clone());
 
-             // This test only verifies the actions and current version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
-             prop_assert_eq!(history.current_version(), new_version);
+             // This test only verifies the actions and last version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
+             prop_assert_eq!(history.last_version(), new_version);
              prop_assert!(new_version > previous_version);
              actions.push(action);
              prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
         fn pop_action(mut history: History<TestAction>) {
-             let previous_version = history.current_version();
+             let previous_version = history.last_version();
              let mut actions = Vec::from_iter(history.actions().cloned());
              let action = history.pop_action();
 
-             // This test only verifies the actions and current version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
+             // This test only verifies the actions and last version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
              prop_assert_eq!(action, actions.pop());
-             prop_assert!(history.current_version() <= previous_version);
-             prop_assert!(action.is_none() || history.current_version() < previous_version);
+             prop_assert!(history.last_version() <= previous_version);
+             prop_assert!(action.is_none() || history.last_version() < previous_version);
              prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
-        fn current_version(history: History<TestAction>) {
-            prop_assert_eq!(Some(history.current_version()), history.versions().last());
+        fn last_version(history: History<TestAction>) {
+            prop_assert_eq!(Some(history.last_version()), history.versions().last());
         }
 
         #[test]

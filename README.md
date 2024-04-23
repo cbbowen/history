@@ -16,7 +16,7 @@ This library provides a middle ground. It stores *O*(log n) states while still a
 
 # Usage
 
-Implement the [`Action`] trait for your action type, add them to the history with [`History::push_action`], and retrieve the current stat with [`History::current_state`]. Remove the most recent action with [`History::pop_action`].
+Implement the [`Action`] trait for your action type, add them to the history with [`History::push_action`], and retrieve the current state with [`History::last_state`]. Remove the most recent action with [`History::pop_action`].
 
 ```rust
 enum MyAction {
@@ -36,9 +36,9 @@ impl history::Action for MyAction {
 
 let mut history = history::History::default();
 history.push_action(MyAction::Add(710));
-assert_eq!(*history.current_state(), 710);
+assert_eq!(*history.last_state(), 710);
 history.push_action(MyAction::Sub(42));
-assert_eq!(*history.current_state(), 668);
+assert_eq!(*history.last_state(), 668);
 history.pop_action();
-assert_eq!(*history.current_state(), 710);
+assert_eq!(*history.last_state(), 710);
 ```
