@@ -33,7 +33,8 @@ pub enum GetStateError<A: Action> {
     ActionFailed(A::Error),
 }
 
-/// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`], and [`History::try_pop_state`].
+/// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`], and
+/// [`History::try_pop_state`].
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 #[error("failed to apply action")]
 pub struct PopError<A: Action>(A::Error);
@@ -458,26 +459,36 @@ mod tests {
         }
     }
 
+    impl Action for Option<TestAction> {
+        type State = Vec<u8>;
+        type Error = ();
+
+        fn apply(&self, state: Self::State) -> Result<Self::State, Self::Error> {
+            let Some(action) = self else { return Err(()) };
+            action.apply(state).map_err(|e| match e {})
+        }
+    }
+
     #[derive(Arbitrary, Clone, Debug)]
-    enum Step {
-        Push(TestAction),
+    enum Step<A> {
+        Push(A),
         Pop,
     }
 
     prop_compose! {
-        fn history_strategy()(steps: Vec<Step>) -> History<TestAction> {
-             let mut history = History::default();
-             for step in steps {
+        fn history_strategy()(steps: Vec<Step<TestAction>>) -> History<TestAction> {
+            let mut history = History::default();
+            for step in steps {
                 match step {
                     Step::Push(action) => {
-                         history.push_action(action);
+                        history.push_action(action);
                     }
                     Step::Pop => {
-                         history.pop_action();
+                        history.pop_action();
                     }
                 }
-             }
-             history
+            }
+            history
         }
     }
 
@@ -492,28 +503,30 @@ mod tests {
     proptest! {
         #[test]
         fn push_action(mut history: History<TestAction>, action: TestAction) {
-             let previous_version = history.last_version();
-             let mut actions = Vec::from_iter(history.actions().cloned());
-             let new_version = history.push_action(action.clone());
+            let previous_version = history.last_version();
+            let mut actions = Vec::from_iter(history.actions().cloned());
+            let new_version = history.push_action(action.clone());
 
-             // This test only verifies the actions and last version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
-             prop_assert_eq!(history.last_version(), new_version);
-             prop_assert!(new_version > previous_version);
-             actions.push(action);
-             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+            // This test only verifies the actions and last version are updated appropriately, not the
+            // states. The consistency of the states with the actions is covered by other tests.
+            prop_assert_eq!(history.last_version(), new_version);
+            prop_assert!(new_version > previous_version);
+            actions.push(action);
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
         #[test]
         fn pop_action(mut history: History<TestAction>) {
-             let previous_version = history.last_version();
-             let mut actions = Vec::from_iter(history.actions().cloned());
-             let action = history.pop_action();
+            let previous_version = history.last_version();
+            let mut actions = Vec::from_iter(history.actions().cloned());
+            let action = history.pop_action();
 
-             // This test only verifies the actions and last version are updated appropriately, not the states. The consistency of the states with the actions is covered by other tests.
-             prop_assert_eq!(action, actions.pop());
-             prop_assert!(history.last_version() <= previous_version);
-             prop_assert!(action.is_none() || history.last_version() < previous_version);
-             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+            // This test only verifies the actions and last version are updated appropriately, not the
+            // states. The consistency of the states with the actions is covered by other tests.
+            prop_assert_eq!(action, actions.pop());
+            prop_assert!(history.last_version() <= previous_version);
+            prop_assert!(action.is_none() || history.last_version() < previous_version);
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
         #[test]
@@ -523,19 +536,76 @@ mod tests {
 
         #[test]
         fn get_state(history: History<TestAction>) {
-             let mut state = Default::default();
-             let mut version_iter = history.versions();
-             let Some(initial_version) = version_iter.next() else {
+            let mut state = Default::default();
+            let mut version_iter = history.versions();
+            let Some(initial_version) = version_iter.next() else {
                 prop_assert!(false);
                 return Ok(());
-             };
-             let actual_state = history.get_state(initial_version);
-             prop_assert_eq!(actual_state.as_ref(), Ok(&state));
-             for (version, action) in version_iter.zip(history.actions()) {
+            };
+            let actual_state = history.get_state(initial_version);
+            prop_assert_eq!(actual_state.as_ref(), Ok(&state));
+            for (version, action) in version_iter.zip(history.actions()) {
                 state = action.apply(state).unwrap();
                 let actual_state = history.get_state(version);
                 prop_assert_eq!(actual_state.as_ref(), Ok(&state));
-             }
+            }
+        }
+    }
+
+    prop_compose! {
+        fn fallible_history_strategy()(steps: Vec<Step<Option<TestAction>>>) -> History<Option<TestAction>> {
+            let mut history = History::default();
+            for step in steps {
+                match step {
+                    Step::Push(action) => {
+                        let _ = history.try_push_action(action);
+                    }
+                    Step::Pop => {
+                        let _ = history.try_pop_action();
+                    }
+                }
+            }
+            history
+        }
+    }
+
+    impl Arbitrary for History<Option<TestAction>> {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+            fallible_history_strategy().boxed()
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn try_push_action(mut history: History<Option<TestAction>>, action: Option<TestAction>) {
+            let previous_version = history.last_version();
+            let mut actions = Vec::from_iter(history.actions().cloned());
+            let must_succeed = actions.iter().all(|a| a.is_some()) && action.is_some();
+            if let Ok(new_version) = history.try_push_action(action.clone()) {
+                prop_assert_eq!(history.last_version(), new_version);
+                prop_assert!(new_version > previous_version);
+                actions.push(action);
+            } else {
+                prop_assert!(!must_succeed);
+            }
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+        }
+
+        #[test]
+        fn try_pop_action(mut history: History<Option<TestAction>>) {
+            let previous_version = history.last_version();
+            let mut actions = Vec::from_iter(history.actions().cloned());
+            let must_succeed = actions.iter().all(|a| a.is_some());
+            if let Ok(action) = history.try_pop_action() {
+                prop_assert_eq!(action, actions.pop());
+                prop_assert!(history.last_version() <= previous_version);
+                prop_assert!(action.is_none() || history.last_version() < previous_version);
+            } else {
+                prop_assert!(!must_succeed);
+            }
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
     }
 
