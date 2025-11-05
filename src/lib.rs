@@ -82,6 +82,11 @@ impl<A: Action> History<A> {
         self.actions.iter()
     }
 
+    /// Returns all the actions from oldest to newest.
+    pub fn into_actions(self) -> impl Iterator<Item = A> {
+        self.actions.into_iter()
+    }
+
     /// Returns all the versions from oldest to newest.
     pub fn versions(&self) -> impl Iterator<Item = Version> {
         (0..=self.actions.len()).map(Version)
