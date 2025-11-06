@@ -180,7 +180,7 @@ impl<A: Action> History<A> {
         });
         let new_version_and_state = new_version_and_state.transpose().map_err(PopError)?;
 
-        // Infallible because it doesn't not perform any action applications. All mutation must
+        // Infallible because it does not perform any action applications. All mutation must
         // happen here.
         let infallible_portion = move || {
             let popped_action = self.actions.pop()?;

@@ -8,7 +8,7 @@ An undo history can be implemented as a stack of application states, where each 
 
 That's often prohibitive, so an undo history is commonly implemented instead as a stack of actions applied to the application state, each of which must be invertible. This is the [command pattern](https://en.wikipedia.org/wiki/Command_pattern). Undo can then be implemented by popping the top action from the stack and applying its inverse to the application state[^1]. This still requires storing *O*(n) actions, but actions are typically _much_ smaller. The disadvantage of this approach is that it requires actions to be invertible. Often, this inverse must be manually implemented for each type of action.
 
-This library provides a middle ground. It stores *O*(log n) states while still allowing pushing and popping actions in *O*(1) (amortized) time and a single action application, all without requiring invertible action. Furthermore, it also allows reconstructing the state at any point in the history in *O*(k + log n) time[^2] where k is the age of the state.
+This library provides a middle ground. It stores *O*(log n) states while still allowing pushing and popping actions in *O*(1) (amortized) time, all without requiring invertible actions. Furthermore, it also allows reconstructing the state at any point in the history in *O*(k + log n) time[^2] where k is the age of the state.
 
 [^1]: Observe that storing a stack of states is a special case of storing a stack of actions where each action is a replacement of the entire state.
 
