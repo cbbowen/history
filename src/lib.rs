@@ -93,6 +93,20 @@ impl<A: Action> History<A> {
         (0..=self.actions.len()).map(Version)
     }
 
+    // Returns the index in the cache that will be removed at the given version.
+    fn cache_index_removed_at_version(version: usize) -> Option<usize> {
+        if version == 0 {
+            return None;
+        }
+        let cache_len = version.ilog2();
+        let index = cache_len as i32 - (version + 1).trailing_zeros() as i32;
+        if index == -1 {
+            return None;
+        }
+        debug_assert!(index > 0);
+        Some(index as usize)
+    }
+
     /// Adds a new action to the end of the history and returns the new version.
     ///
     /// # Example
@@ -122,18 +136,15 @@ impl<A: Action> History<A> {
             Err(error) => return Err(PushError { action, error }),
         };
         self.actions.push(action);
-        let new_version = Version(self.actions.len());
 
-        // Restore invariants.
-        let num_states = self.states.len();
-        let index_to_remove =
-            num_states as isize - (1 + (new_version.0 + 1).trailing_zeros()) as isize;
-        debug_assert!(index_to_remove > 0 || index_to_remove == -1);
-        if index_to_remove > 0 {
+        // Determine which state will be removed.
+        if let Some(index_to_remove) = Self::cache_index_removed_at_version(self.actions.len()) {
             // This takes `O(k)` time but `k` is exponentially-distributed, so amortized, it is
             // `O(1)`.
-            self.states.remove(index_to_remove as usize);
+            self.states.remove(index_to_remove);
         }
+
+        let new_version = Version(self.actions.len());
         self.states.push((new_version, new_state));
         Ok(new_version)
     }
@@ -167,17 +178,15 @@ impl<A: Action> History<A> {
     /// Takes *O*(1) amortized time.
     pub fn try_pop_action_and_state(&mut self) -> Result<Option<(A, A::State)>, PopError<A>> {
         let removed_version = self.actions.len();
-        let new_index =
-            (self.states.len() as isize - 1) - (removed_version + 1).trailing_zeros() as isize;
-        let new_version_and_state = (new_index > 0).then(|| {
-            let new_index = new_index as usize;
-            let new_version = removed_version + 1 - (1 << (self.states.len() - new_index));
-            let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
-            let state = self.actions[recent_version..new_version]
-                .iter()
-                .try_fold(state.clone(), |s, a| a.apply(s));
-            state.map(|s| (Version(new_version), s))
-        });
+        let new_version_and_state =
+            Self::cache_index_removed_at_version(removed_version).map(|new_index| {
+                let new_version = removed_version + 1 - (1 << (self.states.len() - new_index));
+                let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
+                let state = self.actions[recent_version..new_version]
+                    .iter()
+                    .try_fold(state.clone(), |s, a| a.apply(s));
+                state.map(|s| (new_index, (Version(new_version), s)))
+            });
         let new_version_and_state = new_version_and_state.transpose().map_err(PopError)?;
 
         // Infallible because it does not perform any action applications. All mutation must
@@ -189,9 +198,8 @@ impl<A: Action> History<A> {
                 .pop()
                 .expect("state/action size match invariant");
 
-            if let Some(new_version_and_state) = new_version_and_state {
-                self.states
-                    .insert(new_index as usize, new_version_and_state);
+            if let Some((new_index, new_version_and_state)) = new_version_and_state {
+                self.states.insert(new_index, new_version_and_state);
             }
 
             Some((popped_action, popped_state))
