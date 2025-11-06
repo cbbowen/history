@@ -133,7 +133,10 @@ criterion_group! {
 criterion_main!(apply_count_benches, clone_count_benches, time_benches);
 
 mod count_measurement {
-    use criterion::measurement::{Measurement, ValueFormatter};
+    use criterion::{
+        Throughput,
+        measurement::{Measurement, ValueFormatter},
+    };
     use rand::Rng;
     use std::{
         ops::{Add, Sub},
@@ -150,9 +153,19 @@ mod count_measurement {
         fn scale_throughputs(
             &self,
             _: f64,
-            _: &criterion::Throughput,
-            _: &mut [f64],
+            throughput: &Throughput,
+            values: &mut [f64],
         ) -> &'static str {
+            let n = match *throughput {
+                Throughput::Bits(n) => n,
+                Throughput::Bytes(n) => n,
+                Throughput::BytesDecimal(n) => n,
+                Throughput::Elements(n) => n,
+            };
+            let scale = (n as f64).recip();
+            for v in values {
+                (*v) *= scale;
+            }
             "results/count"
         }
 
