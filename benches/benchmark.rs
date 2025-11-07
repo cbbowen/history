@@ -3,7 +3,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main, measurement::Measurement,
 };
 use history::*;
-use std::{convert::Infallible, fmt, hint::black_box, marker::PhantomData};
+use std::{hint::black_box, marker::PhantomData};
 
 #[derive(Default, Clone)]
 struct Noop<State> {
@@ -11,8 +11,6 @@ struct Noop<State> {
 }
 impl<State: Clone> Action for Noop<State> {
     type State = State;
-    type Context = ();
-    type Error = Infallible;
 
     fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         Ok(state)
@@ -23,8 +21,6 @@ impl<State: Clone> Action for Noop<State> {
 struct CountApplyAction;
 impl Action for CountApplyAction {
     type State = u8;
-    type Context = ();
-    type Error = Infallible;
 
     fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         CountMeasurement::increment();

@@ -26,8 +26,6 @@ enum MyAction {
 
 impl history::Action for MyAction {
 	type State = i32;
-	type Context = ();
-	type Error = std::convert::Infallible;
 	fn apply(&self, state: i32, _: &mut Self::Context) -> Result<i32, Self::Error> {
 		Ok(match self {
 			MyAction::Add(a) => state + a,

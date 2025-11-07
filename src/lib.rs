@@ -1,3 +1,4 @@
+#![feature(associated_type_defaults)]
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
@@ -5,8 +6,8 @@
 pub trait Action {
     /// The type of state this action affects.
     type State: Clone;
-    type Context;
-    type Error;
+    type Context = ();
+    type Error = std::convert::Infallible;
 
     /// Applies this action to a state, producing a new state.
     fn apply(
@@ -70,8 +71,6 @@ impl<A: Action> History<A> {
     /// # struct NoOp;
     /// # impl Action for NoOp {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(state) }
     /// # }
     /// let history = History::<NoOp>::new(42);
@@ -123,8 +122,6 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -174,8 +171,6 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -238,8 +233,6 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -275,8 +268,6 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -365,8 +356,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -397,8 +386,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -430,8 +417,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -463,8 +448,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -500,8 +483,6 @@ impl<A: Action<Context = ()>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -530,8 +511,6 @@ impl<A: Action<Context = ()>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -561,8 +540,6 @@ impl<A: Action<Context = ()>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -592,8 +569,6 @@ impl<A: Action<Context = ()>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -627,8 +602,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -657,8 +630,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -688,8 +659,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -719,8 +688,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
-    /// #  type Context = ();
-    /// #  type Error = std::convert::Infallible;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -752,21 +719,18 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use proptest_derive::Arbitrary;
-    use std::convert::Infallible;
 
     #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
     struct TestAction(u8);
 
     impl Action for TestAction {
         type State = Vec<TestAction>;
-        type Context = ();
-        type Error = Infallible;
 
         fn apply(
             &self,
             mut state: Self::State,
             _: &mut Self::Context,
-        ) -> Result<Self::State, Infallible> {
+        ) -> Result<Self::State, Self::Error> {
             state.push(*self);
             Ok(state)
         }
@@ -774,7 +738,6 @@ mod tests {
 
     impl Action for Option<TestAction> {
         type State = Vec<TestAction>;
-        type Context = ();
         type Error = ();
 
         fn apply(
