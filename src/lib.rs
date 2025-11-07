@@ -5,10 +5,15 @@
 pub trait Action {
     /// The type of state this action affects.
     type State: Clone;
+    type Context;
     type Error;
 
     /// Applies this action to a state, producing a new state.
-    fn apply(&self, state: Self::State) -> Result<Self::State, Self::Error>;
+    fn apply(
+        &self,
+        state: Self::State,
+        context: &mut Self::Context,
+    ) -> Result<Self::State, Self::Error>;
 }
 
 /// Identifies a specific version in the history.
@@ -65,8 +70,9 @@ impl<A: Action> History<A> {
     /// # struct NoOp;
     /// # impl Action for NoOp {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(state) }
     /// # }
     /// let history = History::<NoOp>::new(42);
     /// assert_eq!(*history.last_state(), 42);
@@ -117,21 +123,27 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// assert_eq!(*history.last_state(), 0);
-    /// let version = history.try_push_action(Add(42)).unwrap();
+    /// let mut context = ();
+    /// let version = history.try_push_action_with(Add(42), &mut context).unwrap();
     /// assert_eq!(*history.last_state(), 42);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn try_push_action(&mut self, action: A) -> Result<Version, PushError<A>> {
-        let new_state = match action.apply(self.last_state().clone()) {
+    pub fn try_push_action_with(
+        &mut self,
+        action: A,
+        context: &mut A::Context,
+    ) -> Result<Version, PushError<A>> {
+        let new_state = match action.apply(self.last_state().clone(), context) {
             Ok(s) => s,
             Err(error) => return Err(PushError { action, error }),
         };
@@ -162,21 +174,26 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// history.push_action(Add(42));
     /// assert_eq!(*history.last_state(), 42);
-    /// assert_eq!(history.try_pop_action_and_state().unwrap(), Some((Add(42), 42)));
+    /// let mut context = ();
+    /// assert_eq!(history.try_pop_action_and_state_with(&mut context).unwrap(), Some((Add(42), 42)));
     /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn try_pop_action_and_state(&mut self) -> Result<Option<(A, A::State)>, PopError<A>> {
+    pub fn try_pop_action_and_state_with(
+        &mut self,
+        context: &mut A::Context,
+    ) -> Result<Option<(A, A::State)>, PopError<A>> {
         let removed_version = self.actions.len();
         let new_version_and_state =
             Self::cache_index_removed_at_version(removed_version).map(|new_index| {
@@ -184,7 +201,7 @@ impl<A: Action> History<A> {
                 let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
                 let state = self.actions[recent_version..new_version]
                     .iter()
-                    .try_fold(state.clone(), |s, a| a.apply(s));
+                    .try_fold(state.clone(), |s, a| a.apply(s, context));
                 state.map(|s| (new_index, (Version(new_version), s)))
             });
         let new_version_and_state = new_version_and_state.transpose().map_err(PopError)?;
@@ -221,22 +238,28 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// history.push_action(Add(42));
     /// assert_eq!(*history.last_state(), 42);
-    /// assert_eq!(history.try_pop_action().unwrap(), Some(Add(42)));
+    /// let mut context = ();
+    /// assert_eq!(history.try_pop_action_with(&mut context).unwrap(), Some(Add(42)));
     /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn try_pop_action(&mut self) -> Result<Option<A>, PopError<A>> {
-        self.try_pop_action_and_state().map(|o| o.map(|(a, _)| a))
+    pub fn try_pop_action_with(
+        &mut self,
+        context: &mut A::Context,
+    ) -> Result<Option<A>, PopError<A>> {
+        self.try_pop_action_and_state_with(context)
+            .map(|o| o.map(|(a, _)| a))
     }
 
     /// Removes the most recent action and returns the state it produced.
@@ -252,22 +275,28 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// history.push_action(Add(42));
     /// assert_eq!(*history.last_state(), 42);
-    /// assert_eq!(history.try_pop_action().unwrap(), Some(Add(42)));
+    /// let mut context = ();
+    /// assert_eq!(history.try_pop_action_with(&mut context).unwrap(), Some(Add(42)));
     /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn try_pop_state(&mut self) -> Result<Option<A::State>, PopError<A>> {
-        self.try_pop_action_and_state().map(|o| o.map(|(_, s)| s))
+    pub fn try_pop_state_with(
+        &mut self,
+        context: &mut A::Context,
+    ) -> Result<Option<A::State>, PopError<A>> {
+        self.try_pop_action_and_state_with(context)
+            .map(|o| o.map(|(_, s)| s))
     }
 
     /// Returns the most recent version.
@@ -302,12 +331,16 @@ impl<A: Action> History<A> {
     }
 
     /// Returns the state at the specified version.
-    pub fn get_state(&self, version: Version) -> Result<A::State, GetStateError<A>> {
+    pub fn try_get_state_with(
+        &self,
+        version: Version,
+        context: &mut A::Context,
+    ) -> Result<A::State, GetStateError<A>> {
         let state_index = self.get_recent_state_index(version)?;
         let (recent_version, state) = self.get_cached_state(state_index);
         self.actions[recent_version.0..version.0]
             .iter()
-            .try_fold(state.clone(), |s, a| a.apply(s))
+            .try_fold(state.clone(), |s, a| a.apply(s, context))
             .map_err(GetStateError::ActionFailed)
     }
 
@@ -332,21 +365,23 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// assert_eq!(*history.last_state(), 0);
-    /// let version = history.push_action(Add(42));
+    /// let mut context = ();
+    /// let version = history.push_action_with(Add(42), &mut context);
     /// assert_eq!(*history.last_state(), 42);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn push_action(&mut self, action: A) -> Version {
-        self.try_push_action(action)
+    pub fn push_action_with(&mut self, action: A, context: &mut A::Context) -> Version {
+        self.try_push_action_with(action, context)
             .unwrap_or_else(|PushError { error, .. }| match error {})
     }
 
@@ -362,22 +397,24 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// history.push_action(Add(42));
     /// assert_eq!(*history.last_state(), 42);
-    /// assert_eq!(history.pop_action_and_state(), Some((Add(42), 42)));
+    /// let mut context = ();
+    /// assert_eq!(history.pop_action_and_state_with(&mut context), Some((Add(42), 42)));
     /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn pop_action_and_state(&mut self) -> Option<(A, A::State)> {
-        self.try_pop_action_and_state()
+    pub fn pop_action_and_state_with(&mut self, context: &mut A::Context) -> Option<(A, A::State)> {
+        self.try_pop_action_and_state_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
     }
 
@@ -393,22 +430,24 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
     /// history.push_action(Add(42));
     /// assert_eq!(*history.last_state(), 42);
-    /// assert_eq!(history.pop_action(), Some(Add(42)));
+    /// let mut context = ();
+    /// assert_eq!(history.pop_action_with(&mut context), Some(Add(42)));
     /// assert_eq!(*history.last_state(), 0);
     /// ```
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) amortized time.
-    pub fn pop_action(&mut self) -> Option<A> {
-        self.try_pop_action()
+    pub fn pop_action_with(&mut self, context: &mut A::Context) -> Option<A> {
+        self.try_pop_action_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
     }
 
@@ -424,8 +463,265 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
     /// #  type Error = std::convert::Infallible;
-    /// #  fn apply(&self, state: i32) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// let mut context = ();
+    /// history.push_action_with(Add(42), &mut context);
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_state(), Some(42));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn pop_state_with(&mut self, context: &mut A::Context) -> Option<A::State> {
+        self.try_pop_state_with(context)
+            .unwrap_or_else(|PopError(error)| match error {})
+    }
+
+    /// Returns the state at the specified version.
+    pub fn get_state_with(&self, version: Version, context: &mut A::Context) -> Option<A::State> {
+        self.try_get_state_with(version, context).ok()
+    }
+}
+
+impl<A: Action<Context = ()>> History<A> {
+    /// Adds a new action to the end of the history and returns the new version.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// assert_eq!(*history.last_state(), 0);
+    /// let version = history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn try_push_action(&mut self, action: A) -> Result<Version, PushError<A>> {
+        self.try_push_action_with(action, &mut ())
+    }
+
+    /// Removes and returns the most recent action and the state it produced.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_action_and_state(), Some((Add(42), 42)));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn try_pop_action_and_state(&mut self) -> Result<Option<(A, A::State)>, PopError<A>> {
+        self.try_pop_action_and_state_with(&mut ())
+    }
+
+    /// Removes and returns the most recent action.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_action(), Some(Add(42)));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn try_pop_action(&mut self) -> Result<Option<A>, PopError<A>> {
+        self.try_pop_action_with(&mut ())
+    }
+
+    /// Removes the most recent action and returns the state it produced.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_state(), Some(42));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn try_pop_state(&mut self) -> Result<Option<A::State>, PopError<A>> {
+        self.try_pop_state_with(&mut ())
+    }
+
+    /// Returns the state at the specified version.
+    pub fn try_get_state(&self, version: Version) -> Result<A::State, GetStateError<A>> {
+        self.try_get_state_with(version, &mut ())
+    }
+}
+
+impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
+    /// Adds a new action to the end of the history and returns the new version.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// assert_eq!(*history.last_state(), 0);
+    /// let version = history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn push_action(&mut self, action: A) -> Version {
+        self.push_action_with(action, &mut ())
+    }
+
+    /// Removes and returns the most recent action and the state it produced.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_action_and_state(), Some((Add(42), 42)));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn pop_action_and_state(&mut self) -> Option<(A, A::State)> {
+        self.pop_action_and_state_with(&mut ())
+    }
+
+    /// Removes and returns the most recent action.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// let before = *history.last_state();
+    /// history.push_action(Add(42));
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.pop_action(), Some(Add(42)));
+    /// assert_eq!(*history.last_state(), 0);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(1) amortized time.
+    pub fn pop_action(&mut self) -> Option<A> {
+        self.pop_action_with(&mut ())
+    }
+
+    /// Removes the most recent action and returns the state it produced.
+    ///
+    /// Returns `None` if there are no actions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
     /// let before = *history.last_state();
@@ -439,8 +735,12 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// Takes *O*(1) amortized time.
     pub fn pop_state(&mut self) -> Option<A::State> {
-        self.try_pop_state()
-            .unwrap_or_else(|PopError(error)| match error {})
+        self.pop_state_with(&mut ())
+    }
+
+    /// Returns the state at the specified version.
+    pub fn get_state(&self, version: Version) -> Option<A::State> {
+        self.get_state_with(version, &mut ())
     }
 }
 
@@ -458,22 +758,32 @@ mod tests {
     struct TestAction(u8);
 
     impl Action for TestAction {
-        type State = Vec<u8>;
+        type State = Vec<TestAction>;
+        type Context = ();
         type Error = Infallible;
 
-        fn apply(&self, mut state: Self::State) -> Result<Self::State, Infallible> {
-            state.push(self.0);
+        fn apply(
+            &self,
+            mut state: Self::State,
+            _: &mut Self::Context,
+        ) -> Result<Self::State, Infallible> {
+            state.push(*self);
             Ok(state)
         }
     }
 
     impl Action for Option<TestAction> {
-        type State = Vec<u8>;
+        type State = Vec<TestAction>;
+        type Context = ();
         type Error = ();
 
-        fn apply(&self, state: Self::State) -> Result<Self::State, Self::Error> {
+        fn apply(
+            &self,
+            state: Self::State,
+            context: &mut Self::Context,
+        ) -> Result<Self::State, Self::Error> {
             let Some(action) = self else { return Err(()) };
-            action.apply(state).map_err(|e| match e {})
+            action.apply(state, context).map_err(|e| match e {})
         }
     }
 
@@ -551,11 +861,11 @@ mod tests {
                 return Ok(());
             };
             let actual_state = history.get_state(initial_version);
-            prop_assert_eq!(actual_state.as_ref(), Ok(&state));
+            prop_assert_eq!(actual_state.as_ref(), Some(&state));
             for (version, action) in version_iter.zip(history.actions()) {
-                state = action.apply(state).unwrap();
+                state = action.apply(state, &mut ()).unwrap();
                 let actual_state = history.get_state(version);
-                prop_assert_eq!(actual_state.as_ref(), Ok(&state));
+                prop_assert_eq!(actual_state.as_ref(), Some(&state));
             }
         }
     }

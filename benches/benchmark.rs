@@ -11,9 +11,10 @@ struct Noop<State> {
 }
 impl<State: Clone> Action for Noop<State> {
     type State = State;
+    type Context = ();
     type Error = Infallible;
 
-    fn apply(&self, state: Self::State) -> Result<Self::State, Self::Error> {
+    fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         Ok(state)
     }
 }
@@ -22,9 +23,10 @@ impl<State: Clone> Action for Noop<State> {
 struct CountApplyAction;
 impl Action for CountApplyAction {
     type State = u8;
+    type Context = ();
     type Error = Infallible;
 
-    fn apply(&self, state: Self::State) -> Result<Self::State, Self::Error> {
+    fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         CountMeasurement::increment();
         Ok(state)
     }
@@ -40,7 +42,7 @@ impl Clone for CloneCountState {
 }
 
 trait BenchmarkConfig {
-    type Action: Default + Clone + Action<State: Default, Error = Infallible>;
+    type Action: Default + Clone + Action<State: Default, Context = (), Error = Infallible>;
     fn name() -> &'static str;
 }
 
