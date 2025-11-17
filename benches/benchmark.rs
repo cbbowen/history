@@ -3,7 +3,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main, measurement::Measurement,
 };
 use history::*;
-use std::{hint::black_box, marker::PhantomData};
+use std::{convert::Infallible, hint::black_box, marker::PhantomData};
 
 #[derive(Default, Clone)]
 struct Noop<State> {
