@@ -99,7 +99,7 @@ impl<A: Action> History<A> {
     }
 
     // Returns the index in the cache that will be removed at the given version.
-    fn cache_index_removed_at_version(version: usize) -> Option<usize> {
+    fn cache_index_removed_at_version(Version(version): Version) -> Option<usize> {
         if version == 0 {
             return None;
         }
@@ -147,13 +147,13 @@ impl<A: Action> History<A> {
         self.actions.push(action);
 
         // Determine which state will be removed.
-        if let Some(index_to_remove) = Self::cache_index_removed_at_version(self.actions.len()) {
+        let new_version = Version(self.actions.len());
+        if let Some(index_to_remove) = Self::cache_index_removed_at_version(new_version) {
             // This takes `O(k)` time but `k` is exponentially-distributed, so amortized, it is
             // `O(1)`.
             self.states.remove(index_to_remove);
         }
 
-        let new_version = Version(self.actions.len());
         self.states.push((new_version, new_state));
         Ok(new_version)
     }
@@ -190,8 +190,8 @@ impl<A: Action> History<A> {
         context: &mut A::Context,
     ) -> Result<Option<(A, A::State)>, PopError<A>> {
         let removed_version = self.actions.len();
-        let new_version_and_state =
-            Self::cache_index_removed_at_version(removed_version).map(|new_index| {
+        let new_version_and_state = Self::cache_index_removed_at_version(Version(removed_version))
+            .map(|new_index| {
                 let new_version = removed_version + 1 - (1 << (self.states.len() - new_index));
                 let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
                 let state = self.actions[recent_version..new_version]
@@ -346,6 +346,16 @@ impl<A: Action> History<A> {
     }
 }
 
+trait ResultExt<T> {
+    fn unwrap_or_infallible(self) -> T;
+}
+
+impl<T> ResultExt<T> for Result<T, std::convert::Infallible> {
+    fn unwrap_or_infallible(self) -> T {
+        self.unwrap_or_else(|error| match error {})
+    }
+}
+
 impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// Adds a new action to the end of the history and returns the new version.
     ///
@@ -370,8 +380,36 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// Takes *O*(1) amortized time.
     pub fn push_action_with(&mut self, action: A, context: &mut A::Context) -> Version {
-        self.try_push_action_with(action, context)
-            .unwrap_or_else(|PushError { error, .. }| match error {})
+        // The implementaiton below is morally equivalent to:
+        // ```
+        // self.try_push_action_with(action, context)
+        //     .unwrap_or_else(|PushError { error, .. }| match error {});
+        // ```
+        // However, we can avoid a clone half the time.
+
+        // Determine which state will be removed.
+        self.actions.push(action);
+        let new_version = Version(self.actions.len());
+        let index_to_remove = Self::cache_index_removed_at_version(new_version);
+
+        // If it's the last state, pop it instead of cloning then removing.
+        let last_state = if index_to_remove.is_some_and(|i| i + 1 == self.states.len()) {
+            self.states.pop().expect("non-empty").1
+        } else {
+            if let Some(index_to_remove) = index_to_remove {
+                self.states.remove(index_to_remove);
+            }
+            self.states.last().expect("non-empty").1.clone()
+        };
+
+        let new_state = self
+            .actions
+            .last()
+            .expect("non-empty")
+            .apply(last_state, context)
+            .unwrap_or_infallible();
+        self.states.push((new_version, new_state));
+        new_version
     }
 
     /// Removes and returns the most recent action and the state it produced.
