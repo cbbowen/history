@@ -3,7 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 /// An action which can be added to a [`History`].
-pub trait Action {
+pub trait Action: Sized {
     /// The type of state this action affects.
     type State: Clone;
     type Context = ();
@@ -15,6 +15,18 @@ pub trait Action {
         state: Self::State,
         context: &mut Self::Context,
     ) -> Result<Self::State, Self::Error>;
+
+    /// Applies a sequence of actions to a state, producing a new state.
+    fn apply_batch(
+        actions: &[Self],
+        mut state: Self::State,
+        context: &mut Self::Context,
+    ) -> Result<Self::State, Self::Error> {
+        for action in actions {
+            state = action.apply(state, context)?;
+        }
+        Ok(state)
+    }
 }
 
 /// Identifies a specific version in the history.
@@ -194,9 +206,11 @@ impl<A: Action> History<A> {
             .map(|new_index| {
                 let new_version = removed_version + 1 - (1 << (self.states.len() - new_index));
                 let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
-                let state = self.actions[recent_version..new_version]
-                    .iter()
-                    .try_fold(state.clone(), |s, a| a.apply(s, context));
+                let state = A::apply_batch(
+                    &self.actions[recent_version..new_version],
+                    state.clone(),
+                    context,
+                );
                 state.map(|s| (new_index, (Version(new_version), s)))
             });
         let new_version_and_state = new_version_and_state.transpose().map_err(PopError)?;
