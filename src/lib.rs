@@ -76,8 +76,11 @@ pub enum RemoveActionError<A: Action> {
     #[error("action index out of range")]
     IndexOutOfRange(usize),
 
+    /// Applying an action failed while rebuilding the cached states. The action to remove is
+    /// still in the history at `index`, which may differ from the requested index: the action
+    /// may have been shifted past actions it commutes with.
     #[error("failed to apply action")]
-    ActionFailed(A::Error),
+    ActionFailed { index: usize, error: A::Error },
 }
 
 /// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`], and
@@ -85,20 +88,6 @@ pub enum RemoveActionError<A: Action> {
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 #[error("failed to apply action")]
 pub struct PopError<A: Action>(A::Error);
-
-impl<A: Action> From<PopError<A>> for GetStateError<A> {
-    fn from(value: PopError<A>) -> Self {
-        let PopError(error) = value;
-        GetStateError::ActionFailed(error)
-    }
-}
-
-impl<A: Action> From<PopError<A>> for RemoveActionError<A> {
-    fn from(value: PopError<A>) -> Self {
-        let PopError(error) = value;
-        RemoveActionError::ActionFailed(error)
-    }
-}
 
 /// The history of state as actions are applied to it.
 #[derive(Debug, Clone)]
@@ -347,14 +336,83 @@ impl<A: Action> History<A> {
             .map(|o| o.map(|(_, s)| s))
     }
 
-    /// If the action at `index` (the `index`th oldest action, which transforms the state at
-    /// version `index` into the state at the following version) commutes with all of the actions
-    /// after it, removes it from the history and returns it.
+    /// Shifts the action at `index` past every consecutive later action it commutes with and
+    /// returns its new index.
     ///
-    /// Returns `None` and leaves the history unchanged if the action does not commute with one of
-    /// the actions after it. Returns an error if the index is out of range or applying an
-    /// action fails while rebuilding the cached states; in that case, the action is not
-    /// removed, but it may have been reordered past some of the actions it commutes with.
+    /// On error, the action sits at the index carried by the error, and the history is valid.
+    fn shift_late(
+        &mut self,
+        index: usize,
+        context: &mut A::Context,
+    ) -> Result<usize, RemoveActionError<A>> {
+        // Determine how late the action can go: just past the last consecutive action it
+        // commutes with.
+        let action = &self.actions[index];
+        let commuting = self.actions[index + 1..]
+            .iter()
+            .take_while(|other| action.commute(other))
+            .count();
+        let target = index + commuting;
+        if target == index {
+            return Ok(index);
+        }
+
+        // Compute the state at version `index`, i.e. the state the action was applied to.
+        let state_at_index = match self.try_get_state_with(Version(index), context) {
+            Ok(state) => state,
+            // Unreachable: `index` is in range, so `Version(index)` is too.
+            Err(GetStateError::VersionOutOfRange(_)) => {
+                return Err(RemoveActionError::IndexOutOfRange(index));
+            }
+            Err(GetStateError::ActionFailed(error)) => {
+                return Err(RemoveActionError::ActionFailed { index, error });
+            }
+        };
+
+        // Shift the action toward `target`, one cached state at a time. Moving the action from
+        // `position` to a cached version `v` only invalidates the cached state at `v`: the old
+        // state there has the shifted action applied somewhere in its middle, `Action::inverse`
+        // shifts it out past the commuting actions (yielding the state at `v - 1` under the new
+        // order), and re-applying `actions[v]` (the action that moves to position `v - 1`) yields
+        // the state at `v`. Each iteration leaves the history fully consistent, so a failed
+        // `apply` merely leaves the action reordered.
+        let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
+        let mut position = index;
+        for cache_index in first_affected..self.states.len() {
+            let (Version(cached_version), state) = &self.states[cache_index];
+            let cached_version = *cached_version;
+            if cached_version > target {
+                break;
+            }
+            let mut shifted = state.clone();
+            self.actions[position].inverse(&state_at_index, &mut shifted);
+            let shifted = match self.actions[cached_version].apply(shifted, context) {
+                Ok(state) => state,
+                Err(error) => {
+                    return Err(RemoveActionError::ActionFailed {
+                        index: position,
+                        error,
+                    });
+                }
+            };
+            self.actions[position..=cached_version].rotate_left(1);
+            self.states[cache_index].1 = shifted;
+            position = cached_version;
+        }
+
+        // Finish the shift past any remaining commuting actions before the next cached state.
+        self.actions[position..=target].rotate_left(1);
+        Ok(target)
+    }
+
+    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
+    /// the state at version `index` into the state at the following version). Later states are
+    /// rebuilt as if the removed action had never been applied.
+    ///
+    /// Returns an error if the index is out of range or applying an action fails while
+    /// rebuilding the cached states; in that case, the action is not removed, but it may have
+    /// been reordered past some of the actions it commutes with —
+    /// [`RemoveActionError::ActionFailed`] carries its current index.
     ///
     /// # Example
     ///
@@ -378,79 +436,139 @@ impl<A: Action> History<A> {
     /// history.push_action(Set(1, 2));
     /// assert_eq!(*history.last_state(), vec![1, 2]);
     /// let mut context = ();
-    /// assert!(history.try_remove_action_with(0, &mut context).unwrap().is_some());
+    /// // `Set(0, 1)` commutes with `Set(1, 2)`, so this removal is cheap.
+    /// assert_eq!(history.try_remove_action_with(0, &mut context).unwrap(), Set(0, 1));
     /// assert_eq!(*history.last_state(), vec![0, 2]);
-    /// assert_eq!(history.actions().count(), 1);
+    /// // Removing an action that does not commute replays the actions after it.
+    /// history.push_action(Set(1, 4));
+    /// assert_eq!(history.try_remove_action_with(0, &mut context).unwrap(), Set(1, 2));
+    /// assert_eq!(*history.last_state(), vec![0, 4]);
     /// ```
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(*n*) time, where *n* is the number of actions after `index` in the history, but
-    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `index`. The consecutive
+    /// actions after `index` that the removed action commutes with are shifted past with only
+    /// *O*(log *n*) state clones, inversions, and applications; the actions after the first
+    /// non-commuting one are re-applied in full.
     pub fn try_remove_action_with(
         &mut self,
         index: usize,
         context: &mut A::Context,
-    ) -> Result<Option<A>, RemoveActionError<A>> {
-        // Removing the most recent action is exactly a pop.
+    ) -> Result<A, RemoveActionError<A>> {
         let Version(last_version) = self.last_version();
         if index >= last_version {
             return Err(RemoveActionError::IndexOutOfRange(index));
         }
-        if index + 1 == last_version {
-            return Ok(self.try_pop_action_with(context)?);
-        }
 
-        // Check that all the necessary actions commute.
-        let action = &self.actions[index];
-        if !self.actions[index + 1..]
-            .iter()
-            .all(|other| action.commute(other))
-        {
-            return Ok(None);
-        }
+        // Shift the action as late as it can go cheaply; only the actions after its new position
+        // need to be replayed.
+        let index = self.shift_late(index, context)?;
 
-        // Compute the state at version `index`, i.e. the state the removed action was applied to.
-        let state_at_version = match self.try_get_state_with(Version(index), context) {
-            Ok(state) => state,
-            // Unreachable: `index` is in range, so `Version(index)` is too.
-            Err(GetStateError::VersionOutOfRange(_)) => {
-                return Err(RemoveActionError::IndexOutOfRange(index));
-            }
-            Err(GetStateError::ActionFailed(error)) => {
-                return Err(RemoveActionError::ActionFailed(error));
-            }
-        };
-
-        // Shift the action to the end, one cached state at a time. Moving the action from
-        // `position` to a cached version `v` only invalidates the cached state at `v`: the old
-        // state there has the removed action applied somewhere in its middle, `Action::inverse`
-        // shifts it out past the commuting actions (yielding the state at `v - 1` under the new
-        // order), and re-applying `actions[v]` (the action that moves to position `v - 1`) yields
-        // the state at `v`. Each iteration leaves the history fully consistent, so a failed
-        // `apply` merely leaves the action reordered, not removed.
+        // The cache transformation is the one a pop from `last_version` performs: the entry at
+        // `last_version` is dropped and one previously evicted entry may be reinserted. In
+        // addition, every cached state after `index` must be rebuilt without the removed action
+        // by replaying the actions after `index`. Every fallible action application happens
+        // before any mutation, so on error the action is still at `index`.
         let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
         let last_cache_index = self.states.len() - 1;
-        let mut position = index;
-        for cache_index in first_affected..last_cache_index {
-            let (Version(cached_version), state) = &self.states[cache_index];
-            let cached_version = *cached_version;
-            let mut shifted = state.clone();
-            self.actions[position].inverse(&state_at_version, &mut shifted);
-            let shifted = self.actions[cached_version]
-                .apply(shifted, context)
-                .map_err(PopError)?;
-            self.actions[position..=cached_version].rotate_left(1);
-            self.states[cache_index].1 = shifted;
-            position = cached_version;
+        let reinserted = Self::cache_index_removed_at_version(Version(last_version)).map(
+            |cache_index| {
+                (
+                    cache_index,
+                    last_version + 1 - (1 << (self.states.len() - cache_index)),
+                )
+            },
+        );
+
+        let mut fixed_states = Vec::with_capacity(last_cache_index - first_affected);
+        let mut reinserted_state = None;
+
+        // A previously evicted entry at or before `index` is unaffected by the removal, so
+        // reconstruct it from the old states, exactly as a pop would.
+        if let Some((cache_index, reinserted_version)) = reinserted {
+            if reinserted_version <= index {
+                let (Version(recent_version), state) = &self.states[cache_index - 1];
+                let state = A::apply_batch(
+                    &self.actions[*recent_version..reinserted_version],
+                    state.clone(),
+                    context,
+                );
+                match state {
+                    Ok(state) => reinserted_state = Some(state),
+                    Err(error) => {
+                        return Err(RemoveActionError::ActionFailed { index, error });
+                    }
+                }
+            }
         }
 
-        // Pop it off the action stack, reusing the pop machinery to rebuild the cache.
-        self.actions[position..].rotate_left(1);
-        let popped = self
-            .try_pop_action_with(context)?
-            .expect("history is non-empty");
-        Ok(Some(popped))
+        // Replay the actions after `index` over the state at `index`, recording the states the
+        // new cache needs: one per cached version in `(index, last_version)`, plus the
+        // reinserted version if it lies after `index`. In the new history, the state at such a
+        // version `v` is the actions at old positions `index + 1..=v` applied to the state at
+        // `index`.
+        let replayed_reinserted_version = reinserted
+            .map(|(_, version)| version)
+            .filter(|version| *version > index);
+        if first_affected < last_cache_index || replayed_reinserted_version.is_some() {
+            // The reinserted version was evicted from the cache, so it never duplicates a cached
+            // version.
+            let mut replay_targets: Vec<(usize, bool)> = self.states
+                [first_affected..last_cache_index]
+                .iter()
+                .map(|(Version(v), _)| (*v, false))
+                .collect();
+            if let Some(version) = replayed_reinserted_version {
+                let position = replay_targets.partition_point(|(v, _)| *v < version);
+                replay_targets.insert(position, (version, true));
+            }
+
+            let mut state = match self.try_get_state_with(Version(index), context) {
+                Ok(state) => state,
+                // Unreachable: `index` is in range, so `Version(index)` is too.
+                Err(GetStateError::VersionOutOfRange(_)) => {
+                    return Err(RemoveActionError::IndexOutOfRange(index));
+                }
+                Err(GetStateError::ActionFailed(error)) => {
+                    return Err(RemoveActionError::ActionFailed { index, error });
+                }
+            };
+            let mut version = index;
+            for (target_version, is_reinserted) in replay_targets {
+                state = match A::apply_batch(
+                    &self.actions[version + 1..=target_version],
+                    state,
+                    context,
+                ) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        return Err(RemoveActionError::ActionFailed { index, error });
+                    }
+                };
+                version = target_version;
+                if is_reinserted {
+                    reinserted_state = Some(state.clone());
+                } else {
+                    fixed_states.push(state.clone());
+                }
+            }
+        }
+
+        // All mutation happens below and is infallible.
+        let action = self.actions.remove(index);
+        for (offset, state) in fixed_states.into_iter().enumerate() {
+            self.states[first_affected + offset].1 = state;
+        }
+        self.states
+            .pop()
+            .expect("state/action size match invariant");
+        if let Some((cache_index, reinserted_version)) = reinserted {
+            let state = reinserted_state.expect("reinserted state is computed above");
+            self.states
+                .insert(cache_index, (Version(reinserted_version), state));
+        }
+        Ok(action)
     }
 
     /// Returns the most recent version.
@@ -673,12 +791,11 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
         self.try_get_state_with(version, context).ok()
     }
 
-    /// If the action at `index` (the `index`th oldest action, which transforms the state at
-    /// version `index` into the state at the following version) commutes with all of the actions
-    /// after it, removes it from the history and returns it.
+    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
+    /// the state at version `index` into the state at the following version). Later states are
+    /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range or the
-    /// action does not commute with one of the actions after it.
+    /// Returns `None` and leaves the history unchanged if `index` is out of range.
     ///
     /// # Example
     ///
@@ -707,13 +824,15 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(*n*) time, where *n* is the number of actions after `index` in the history, but
-    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `index`. The consecutive
+    /// actions after `index` that the removed action commutes with are shifted past with only
+    /// *O*(log *n*) state clones, inversions, and applications; the actions after the first
+    /// non-commuting one are re-applied in full.
     pub fn remove_action_with(&mut self, index: usize, context: &mut A::Context) -> Option<A> {
         match self.try_remove_action_with(index, context) {
-            Ok(action) => action,
+            Ok(action) => Some(action),
             Err(RemoveActionError::IndexOutOfRange(_)) => None,
-            Err(RemoveActionError::ActionFailed(error)) => match error {},
+            Err(RemoveActionError::ActionFailed { error, .. }) => match error {},
         }
     }
 }
@@ -831,14 +950,14 @@ impl<A: Action<Context = ()>> History<A> {
         self.try_pop_state_with(&mut ())
     }
 
-    /// If the action at `index` (the `index`th oldest action, which transforms the state at
-    /// version `index` into the state at the following version) commutes with all of the actions
-    /// after it, removes it from the history and returns it.
+    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
+    /// the state at version `index` into the state at the following version). Later states are
+    /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns `None` and leaves the history unchanged if the action does not commute with one
-    /// of the actions after it. Returns an error if the index is out of range or applying an
-    /// action fails while rebuilding the cached states; in that case, the action is not removed,
-    /// but it may have been reordered past some of the actions it commutes with.
+    /// Returns an error if the index is out of range or applying an action fails while
+    /// rebuilding the cached states; in that case, the action is not removed, but it may have
+    /// been reordered past some of the actions it commutes with —
+    /// [`RemoveActionError::ActionFailed`] carries its current index.
     ///
     /// # Example
     ///
@@ -860,15 +979,17 @@ impl<A: Action<Context = ()>> History<A> {
     /// let mut history = History::new(vec![0, 0]);
     /// history.push_action(Set(0, 1));
     /// history.push_action(Set(1, 2));
-    /// assert_eq!(history.try_remove_action(0).unwrap(), Some(Set(0, 1)));
+    /// assert_eq!(history.try_remove_action(0).unwrap(), Set(0, 1));
     /// assert_eq!(*history.last_state(), vec![0, 2]);
     /// ```
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(*n*) time, where *n* is the number of actions after `index` in the history, but
-    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
-    pub fn try_remove_action(&mut self, index: usize) -> Result<Option<A>, RemoveActionError<A>> {
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `index`. The consecutive
+    /// actions after `index` that the removed action commutes with are shifted past with only
+    /// *O*(log *n*) state clones, inversions, and applications; the actions after the first
+    /// non-commuting one are re-applied in full.
+    pub fn try_remove_action(&mut self, index: usize) -> Result<A, RemoveActionError<A>> {
         self.try_remove_action_with(index, &mut ())
     }
 
@@ -991,12 +1112,11 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
         self.pop_state_with(&mut ())
     }
 
-    /// If the action at `index` (the `index`th oldest action, which transforms the state at
-    /// version `index` into the state at the following version) commutes with all of the actions
-    /// after it, removes it from the history and returns it.
+    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
+    /// the state at version `index` into the state at the following version). Later states are
+    /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range or the
-    /// action does not commute with one of the actions after it.
+    /// Returns `None` and leaves the history unchanged if `index` is out of range.
     ///
     /// # Example
     ///
@@ -1024,8 +1144,10 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(*n*) time, where *n* is the number of actions after `index` in the history, but
-    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `index`. The consecutive
+    /// actions after `index` that the removed action commutes with are shifted past with only
+    /// *O*(log *n*) state clones, inversions, and applications; the actions after the first
+    /// non-commuting one are re-applied in full.
     pub fn remove_action(&mut self, index: usize) -> Option<A> {
         self.remove_action_with(index, &mut ())
     }
@@ -1206,17 +1328,12 @@ mod tests {
                 history.push_action(*action);
             }
 
-            let action = actions[index];
-            let removable = actions[index + 1..].iter().all(|other| action.commute(other));
-            prop_assert_eq!(
-                history.try_remove_action_with(index, &mut ()).unwrap().is_some(),
-                removable
-            );
-
             let mut expected_actions = actions.clone();
-            if removable {
-                expected_actions.remove(index);
-            }
+            let expected_removed = expected_actions.remove(index);
+            prop_assert_eq!(
+                history.try_remove_action_with(index, &mut ()).unwrap(),
+                expected_removed
+            );
             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), expected_actions.clone());
 
             // The history must be indistinguishable from one built from the remaining actions.
