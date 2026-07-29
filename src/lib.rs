@@ -8,6 +8,7 @@ pub trait Action: Sized {
     type State: Clone;
     type Context = ();
     type Error = std::convert::Infallible;
+    type Centralizer<'a>: Centralizer<'a, Self> = NonCommutative;
 
     /// Applies this action to a state, producing a new state.
     fn apply(
@@ -28,21 +29,14 @@ pub trait Action: Sized {
         Ok(state)
     }
 
-    /// Returns whether this action commutes with another.
-    ///
-    /// To be precise, for all `s`, `self.inverse(other.apply(self.apply(s)))` must be equivalent to
-    /// `other.apply(s)`.
-    fn commute(&self, other: &Self) -> bool {
-        false
-    }
-
     /// Applies the inverse of this action to a given state in place.
     ///
     /// For all `previous_state`, `self.inverse(previous_state, state)` where `state` is
     /// `self.apply(previous_state)` must leave `state` equivalent to `previous_state`. Observe that
-    /// if `commute` always returns `false`, cloning `previous_state` into `state` is always a
-    /// correct implementation. However, history surgery can be made more efficient with an
-    /// implementation that only restores the portion of the state this action actually affects.
+    /// if [`Self::Centralizer`] never reports that an action commutes, cloning `previous_state`
+    /// into `state` is always a correct implementation. However, history surgery can be made more
+    /// efficient with an implementation that only restores the portion of the state this action
+    /// actually affects.
     fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
         state.clone_from(previous_state);
     }
@@ -51,6 +45,30 @@ pub trait Action: Sized {
 /// Identifies a specific version in the history.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(usize);
+
+/// Represents the set of actions an action commutes with.
+///
+/// To be precise, if `Centralizer::for_action(a).commutes(b)`, then for all `s`,
+/// `a.inverse(b.apply(a.apply(s)))` *must* be equivalent to `b.apply(s)`.
+///
+/// False negative results will make the `remove_action` family of functions fall back to slower
+/// (but correct) implementations. False positive results will produce incorrect states.
+pub trait Centralizer<'a, A: Action> {
+    fn for_action(action: &'a A) -> Self;
+    fn commutes(&self, other: &A) -> bool;
+}
+
+/// A centralizer for an action that might not commute with any other action.
+pub struct NonCommutative;
+
+impl<'a, A: Action> Centralizer<'a, A> for NonCommutative {
+    fn for_action(_action: &'a A) -> Self {
+        Self
+    }
+    fn commutes(&self, _other: &A) -> bool {
+        false
+    }
+}
 
 /// The error type of [`History::try_push_action`].
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
@@ -346,12 +364,15 @@ impl<A: Action> History<A> {
         context: &mut A::Context,
     ) -> Result<usize, RemoveActionError<A>> {
         // Determine how late the action can go: just past the last consecutive action it
-        // commutes with.
-        let action = &self.actions[index];
-        let commuting = self.actions[index + 1..]
-            .iter()
-            .take_while(|other| action.commute(other))
-            .count();
+        // commutes with. The centralizer borrows the action, so it must be dropped before the
+        // reordering below.
+        let commuting = {
+            let centralizer = A::Centralizer::for_action(&self.actions[index]);
+            self.actions[index + 1..]
+                .iter()
+                .take_while(|other| centralizer.commutes(other))
+                .count()
+        };
         let target = index + commuting;
         if target == index {
             return Ok(index);
@@ -420,13 +441,18 @@ impl<A: Action> History<A> {
     /// # use history::*;
     /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     /// # struct Set(usize, i32);
+    /// # struct OtherIndices(usize);
+    /// # impl<'a> Centralizer<'a, Set> for OtherIndices {
+    /// #  fn for_action(action: &'a Set) -> Self { Self(action.0) }
+    /// #  fn commutes(&self, other: &Set) -> bool { self.0 != other.0 }
+    /// # }
     /// # impl Action for Set {
     /// #  type State = Vec<i32>;
+    /// #  type Centralizer<'a> = OtherIndices;
     /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
     /// #   state[self.0] = self.1;
     /// #   Ok(state)
     /// #  }
-    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
     /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
     /// #   state[self.0] = previous_state[self.0];
     /// #  }
@@ -472,14 +498,13 @@ impl<A: Action> History<A> {
         // before any mutation, so on error the action is still at `index`.
         let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
         let last_cache_index = self.states.len() - 1;
-        let reinserted = Self::cache_index_removed_at_version(Version(last_version)).map(
-            |cache_index| {
+        let reinserted =
+            Self::cache_index_removed_at_version(Version(last_version)).map(|cache_index| {
                 (
                     cache_index,
                     last_version + 1 - (1 << (self.states.len() - cache_index)),
                 )
-            },
-        );
+            });
 
         let mut fixed_states = Vec::with_capacity(last_cache_index - first_affected);
         let mut reinserted_state = None;
@@ -803,13 +828,18 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// # use history::*;
     /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     /// # struct Set(usize, i32);
+    /// # struct OtherIndices(usize);
+    /// # impl<'a> Centralizer<'a, Set> for OtherIndices {
+    /// #  fn for_action(action: &'a Set) -> Self { Self(action.0) }
+    /// #  fn commutes(&self, other: &Set) -> bool { self.0 != other.0 }
+    /// # }
     /// # impl Action for Set {
     /// #  type State = Vec<i32>;
+    /// #  type Centralizer<'a> = OtherIndices;
     /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
     /// #   state[self.0] = self.1;
     /// #   Ok(state)
     /// #  }
-    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
     /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
     /// #   state[self.0] = previous_state[self.0];
     /// #  }
@@ -965,13 +995,18 @@ impl<A: Action<Context = ()>> History<A> {
     /// # use history::*;
     /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     /// # struct Set(usize, i32);
+    /// # struct OtherIndices(usize);
+    /// # impl<'a> Centralizer<'a, Set> for OtherIndices {
+    /// #  fn for_action(action: &'a Set) -> Self { Self(action.0) }
+    /// #  fn commutes(&self, other: &Set) -> bool { self.0 != other.0 }
+    /// # }
     /// # impl Action for Set {
     /// #  type State = Vec<i32>;
+    /// #  type Centralizer<'a> = OtherIndices;
     /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
     /// #   state[self.0] = self.1;
     /// #   Ok(state)
     /// #  }
-    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
     /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
     /// #   state[self.0] = previous_state[self.0];
     /// #  }
@@ -1124,13 +1159,18 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// # use history::*;
     /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     /// # struct Set(usize, i32);
+    /// # struct OtherIndices(usize);
+    /// # impl<'a> Centralizer<'a, Set> for OtherIndices {
+    /// #  fn for_action(action: &'a Set) -> Self { Self(action.0) }
+    /// #  fn commutes(&self, other: &Set) -> bool { self.0 != other.0 }
+    /// # }
     /// # impl Action for Set {
     /// #  type State = Vec<i32>;
+    /// #  type Centralizer<'a> = OtherIndices;
     /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
     /// #   state[self.0] = self.1;
     /// #   Ok(state)
     /// #  }
-    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
     /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
     /// #   state[self.0] = previous_state[self.0];
     /// #  }
@@ -1295,8 +1335,22 @@ mod tests {
         }
     }
 
+    /// The centralizer of a [`SetSlot`]: every action on a different slot.
+    struct OtherSlots(usize);
+
+    impl<'a> Centralizer<'a, SetSlot> for OtherSlots {
+        fn for_action(action: &'a SetSlot) -> Self {
+            Self(action.slot())
+        }
+
+        fn commutes(&self, other: &SetSlot) -> bool {
+            self.0 != other.slot()
+        }
+    }
+
     impl Action for SetSlot {
         type State = [u8; SLOT_COUNT];
+        type Centralizer<'a> = OtherSlots;
 
         fn apply(
             &self,
@@ -1305,10 +1359,6 @@ mod tests {
         ) -> Result<Self::State, Self::Error> {
             state[self.slot()] = self.value;
             Ok(state)
-        }
-
-        fn commute(&self, other: &Self) -> bool {
-            self.slot() != other.slot()
         }
 
         fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
