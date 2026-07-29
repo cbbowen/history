@@ -511,19 +511,19 @@ impl<A: Action> History<A> {
 
         // A previously evicted entry at or before `index` is unaffected by the removal, so
         // reconstruct it from the old states, exactly as a pop would.
-        if let Some((cache_index, reinserted_version)) = reinserted {
-            if reinserted_version <= index {
-                let (Version(recent_version), state) = &self.states[cache_index - 1];
-                let state = A::apply_batch(
-                    &self.actions[*recent_version..reinserted_version],
-                    state.clone(),
-                    context,
-                );
-                match state {
-                    Ok(state) => reinserted_state = Some(state),
-                    Err(error) => {
-                        return Err(RemoveActionError::ActionFailed { index, error });
-                    }
+        if let Some((cache_index, reinserted_version)) = reinserted
+            && reinserted_version <= index
+        {
+            let (Version(recent_version), state) = &self.states[cache_index - 1];
+            let state = A::apply_batch(
+                &self.actions[*recent_version..reinserted_version],
+                state.clone(),
+                context,
+            );
+            match state {
+                Ok(state) => reinserted_state = Some(state),
+                Err(error) => {
+                    return Err(RemoveActionError::ActionFailed { index, error });
                 }
             }
         }
