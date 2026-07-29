@@ -27,6 +27,25 @@ pub trait Action: Sized {
         }
         Ok(state)
     }
+
+    /// Returns whether this action commutes with another.
+    ///
+    /// To be precise, for all `s`, `self.inverse(other.apply(self.apply(s)))` must be equivalent to
+    /// `other.apply(s)`.
+    fn commute(&self, other: &Self) -> bool {
+        false
+    }
+
+    /// Applies the inverse of this action to a given state in place.
+    ///
+    /// For all `previous_state`, `self.inverse(previous_state, state)` where `state` is
+    /// `self.apply(previous_state)` must leave `state` equivalent to `previous_state`. Observe that
+    /// if `commute` always returns `false`, cloning `previous_state` into `state` is always a
+    /// correct implementation. However, history surgery can be made more efficient with an
+    /// implementation that only restores the portion of the state this action actually affects.
+    fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
+        state.clone_from(previous_state);
+    }
 }
 
 /// Identifies a specific version in the history.
@@ -41,7 +60,7 @@ pub struct PushError<A: Action> {
     error: A::Error,
 }
 
-/// The error type of [`History::get_state`].
+/// The error type of [`History::try_get_state`] and [`History::try_remove_action_with`].
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum GetStateError<A: Action> {
     #[error("version out of range")]
@@ -56,6 +75,13 @@ pub enum GetStateError<A: Action> {
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 #[error("failed to apply action")]
 pub struct PopError<A: Action>(A::Error);
+
+impl<A: Action> From<PopError<A>> for GetStateError<A> {
+    fn from(value: PopError<A>) -> Self {
+        let PopError(error) = value;
+        GetStateError::ActionFailed(error)
+    }
+}
 
 /// The history of state as actions are applied to it.
 #[derive(Debug, Clone)]
@@ -304,6 +330,105 @@ impl<A: Action> History<A> {
             .map(|o| o.map(|(_, s)| s))
     }
 
+    /// If the action applied at `version` (the action that transforms the state at `version`
+    /// into the state at the following version) commutes with all of the actions after it,
+    /// removes it from the history and returns it.
+    ///
+    /// Returns `None` and leaves the history unchanged if the action does not commute with one of
+    /// the actions after it. Returns an error if the version is out of range or applying an
+    /// action fails while rebuilding the cached states; in that case, the action is not
+    /// removed, but it may have been reordered past some of the actions it commutes with.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// # struct Set(usize, i32);
+    /// # impl Action for Set {
+    /// #  type State = Vec<i32>;
+    /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
+    /// #   state[self.0] = self.1;
+    /// #   Ok(state)
+    /// #  }
+    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
+    /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+    /// #   state[self.0] = previous_state[self.0];
+    /// #  }
+    /// # }
+    /// let mut history = History::new(vec![0, 0]);
+    /// let version = history.last_version();
+    /// history.push_action(Set(0, 1));
+    /// history.push_action(Set(1, 2));
+    /// assert_eq!(*history.last_state(), vec![1, 2]);
+    /// let mut context = ();
+    /// assert!(history.try_remove_action_with(version, &mut context).unwrap().is_some());
+    /// assert_eq!(*history.last_state(), vec![0, 2]);
+    /// assert_eq!(history.actions().count(), 1);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `version` in the history, but
+    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    pub fn try_remove_action_with(
+        &mut self,
+        version: Version,
+        context: &mut A::Context,
+    ) -> Result<Option<A>, GetStateError<A>> {
+        // Removing the most recent action is exactly a pop.
+        let Version(index) = version;
+        let Version(last_version) = self.last_version();
+        if index >= last_version {
+            return Err(GetStateError::VersionOutOfRange(version));
+        }
+        if index + 1 == last_version {
+            return Ok(self.try_pop_action_with(context)?);
+        }
+
+        // Check that all the necessary actions commute.
+        let action = &self.actions[index];
+        if !self.actions[index + 1..]
+            .iter()
+            .all(|other| action.commute(other))
+        {
+            return Ok(None);
+        }
+
+        // Compute the state at the version, i.e. the state the removed action was applied to.
+        let state_at_version = self.try_get_state_with(version, context)?;
+
+        // Shift the action to the end, one cached state at a time. Moving the action from
+        // `position` to a cached version `v` only invalidates the cached state at `v`: the old
+        // state there has the removed action applied somewhere in its middle, `Action::inverse`
+        // shifts it out past the commuting actions (yielding the state at `v - 1` under the new
+        // order), and re-applying `actions[v]` (the action that moves to position `v - 1`) yields
+        // the state at `v`. Each iteration leaves the history fully consistent, so a failed
+        // `apply` merely leaves the action reordered, not removed.
+        let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
+        let last_cache_index = self.states.len() - 1;
+        let mut position = index;
+        for cache_index in first_affected..last_cache_index {
+            let (Version(cached_version), state) = &self.states[cache_index];
+            let cached_version = *cached_version;
+            let mut shifted = state.clone();
+            self.actions[position].inverse(&state_at_version, &mut shifted);
+            let shifted = self.actions[cached_version]
+                .apply(shifted, context)
+                .map_err(PopError)?;
+            self.actions[position..=cached_version].rotate_left(1);
+            self.states[cache_index].1 = shifted;
+            position = cached_version;
+        }
+
+        // Pop it off the action stack, reusing the pop machinery to rebuild the cache.
+        self.actions[position..].rotate_left(1);
+        let popped = self
+            .try_pop_action_with(context)?
+            .expect("history is non-empty");
+        Ok(Some(popped))
+    }
+
     /// Returns the most recent version.
     pub fn last_version(&self) -> Version {
         Version(self.actions.len())
@@ -523,6 +648,51 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     pub fn get_state_with(&self, version: Version, context: &mut A::Context) -> Option<A::State> {
         self.try_get_state_with(version, context).ok()
     }
+
+    /// If the action applied at `version` (the action that transforms the state at `version`
+    /// into the state at the following version) commutes with all of the actions after it,
+    /// removes it from the history and returns it.
+    ///
+    /// Returns `None` and leaves the history unchanged if `version` is out of range or the
+    /// action does not commute with one of the actions after it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// # struct Set(usize, i32);
+    /// # impl Action for Set {
+    /// #  type State = Vec<i32>;
+    /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
+    /// #   state[self.0] = self.1;
+    /// #   Ok(state)
+    /// #  }
+    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
+    /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+    /// #   state[self.0] = previous_state[self.0];
+    /// #  }
+    /// # }
+    /// let mut history = History::new(vec![0, 0]);
+    /// let version = history.last_version();
+    /// history.push_action(Set(0, 1));
+    /// history.push_action(Set(1, 2));
+    /// let mut context = ();
+    /// assert_eq!(history.remove_action_with(version, &mut context), Some(Set(0, 1)));
+    /// assert_eq!(*history.last_state(), vec![0, 2]);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*n*) time, where *n* is the number of actions action `version` in the history, but
+    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    pub fn remove_action_with(&mut self, version: Version, context: &mut A::Context) -> Option<A> {
+        match self.try_remove_action_with(version, context) {
+            Ok(action) => action,
+            Err(GetStateError::VersionOutOfRange(_)) => None,
+            Err(GetStateError::ActionFailed(error)) => match error {},
+        }
+    }
 }
 
 impl<A: Action<Context = ()>> History<A> {
@@ -636,6 +806,48 @@ impl<A: Action<Context = ()>> History<A> {
     /// Takes *O*(1) amortized time.
     pub fn try_pop_state(&mut self) -> Result<Option<A::State>, PopError<A>> {
         self.try_pop_state_with(&mut ())
+    }
+
+    /// If the action applied at `version` (the action that transforms the state at `version`
+    /// into the state at the following version) commutes with all of the actions after it,
+    /// removes it from the history and returns it.
+    ///
+    /// Returns `None` and leaves the history unchanged if the action does not commute with one
+    /// of the actions after it. Returns an error if the version is out of range or applying an
+    /// action fails while rebuilding the cached states; in that case, the action is not removed,
+    /// but it may have been reordered past some of the actions it commutes with.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// # struct Set(usize, i32);
+    /// # impl Action for Set {
+    /// #  type State = Vec<i32>;
+    /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
+    /// #   state[self.0] = self.1;
+    /// #   Ok(state)
+    /// #  }
+    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
+    /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+    /// #   state[self.0] = previous_state[self.0];
+    /// #  }
+    /// # }
+    /// let mut history = History::new(vec![0, 0]);
+    /// let version = history.last_version();
+    /// history.push_action(Set(0, 1));
+    /// history.push_action(Set(1, 2));
+    /// assert_eq!(history.try_remove_action(version).unwrap(), Some(Set(0, 1)));
+    /// assert_eq!(*history.last_state(), vec![0, 2]);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `version` in the history, but
+    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    pub fn try_remove_action(&mut self, version: Version) -> Result<Option<A>, GetStateError<A>> {
+        self.try_remove_action_with(version, &mut ())
     }
 
     /// Returns the state at the specified version.
@@ -755,6 +967,46 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Takes *O*(1) amortized time.
     pub fn pop_state(&mut self) -> Option<A::State> {
         self.pop_state_with(&mut ())
+    }
+
+    /// If the action applied at `version` (the action that transforms the state at `version`
+    /// into the state at the following version) commutes with all of the actions after it,
+    /// removes it from the history and returns it.
+    ///
+    /// Returns `None` and leaves the history unchanged if `version` is out of range or the
+    /// action does not commute with one of the actions after it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// # struct Set(usize, i32);
+    /// # impl Action for Set {
+    /// #  type State = Vec<i32>;
+    /// #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
+    /// #   state[self.0] = self.1;
+    /// #   Ok(state)
+    /// #  }
+    /// #  fn commute(&self, other: &Self) -> bool { self.0 != other.0 }
+    /// #  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+    /// #   state[self.0] = previous_state[self.0];
+    /// #  }
+    /// # }
+    /// let mut history = History::new(vec![0, 0]);
+    /// let version = history.last_version();
+    /// history.push_action(Set(0, 1));
+    /// history.push_action(Set(1, 2));
+    /// assert_eq!(history.remove_action(version), Some(Set(0, 1)));
+    /// assert_eq!(*history.last_state(), vec![0, 2]);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*n*) time, where *n* is the number of actions after `version` in the history, but
+    /// performs only *O*(log *n*) state clones and calls to [`Action::inverse`].
+    pub fn remove_action(&mut self, version: Version) -> Option<A> {
+        self.remove_action_with(version, &mut ())
     }
 
     /// Returns the state at the specified version.
@@ -882,6 +1134,87 @@ mod tests {
                 let actual_state = history.get_state(version);
                 prop_assert_eq!(actual_state.as_ref(), Some(&state));
             }
+        }
+    }
+
+    const SLOT_COUNT: usize = 4;
+
+    /// An action which sets one of [`SLOT_COUNT`] slots; actions on distinct slots commute.
+    #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
+    struct SetSlot {
+        slot: u8,
+        value: u8,
+    }
+
+    impl SetSlot {
+        fn slot(&self) -> usize {
+            usize::from(self.slot) % SLOT_COUNT
+        }
+    }
+
+    impl Action for SetSlot {
+        type State = [u8; SLOT_COUNT];
+
+        fn apply(
+            &self,
+            mut state: Self::State,
+            _: &mut Self::Context,
+        ) -> Result<Self::State, Self::Error> {
+            state[self.slot()] = self.value;
+            Ok(state)
+        }
+
+        fn commute(&self, other: &Self) -> bool {
+            self.slot() != other.slot()
+        }
+
+        fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
+            state[self.slot()] = previous_state[self.slot()];
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn try_remove_action(
+            actions in prop::collection::vec(any::<SetSlot>(), 1..32),
+            index in any::<prop::sample::Index>(),
+        ) {
+            let index = index.index(actions.len());
+            let mut history = History::new([0; SLOT_COUNT]);
+            for action in &actions {
+                history.push_action(*action);
+            }
+
+            let action = actions[index];
+            let removable = actions[index + 1..].iter().all(|other| action.commute(other));
+            prop_assert_eq!(
+                history.try_remove_action_with(Version(index), &mut ()).unwrap().is_some(),
+                removable
+            );
+
+            let mut expected_actions = actions.clone();
+            if removable {
+                expected_actions.remove(index);
+            }
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), expected_actions.clone());
+
+            // The history must be indistinguishable from one built from the remaining actions.
+            let mut expected = History::new([0; SLOT_COUNT]);
+            for action in &expected_actions {
+                expected.push_action(*action);
+            }
+            prop_assert_eq!(history.cached_versions(), expected.cached_versions());
+            for version in history.versions() {
+                prop_assert_eq!(history.get_state(version), expected.get_state(version));
+            }
+        }
+
+        #[test]
+        fn try_remove_action_out_of_range(mut history: History<TestAction>) {
+            let version = history.last_version();
+            let actions = Vec::from_iter(history.actions().cloned());
+            prop_assert_eq!(history.try_remove_action_with(version, &mut ()), Err(GetStateError::VersionOutOfRange(version)));
+            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
     }
 
