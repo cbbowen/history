@@ -66,6 +66,14 @@ impl BenchmarkConfig for CountCloneConfig {
     }
 }
 
+fn filled_history<Config: BenchmarkConfig>(count: u64) -> History<Config::Action> {
+    let mut history = History::default();
+    for _ in 0..count {
+        black_box(history.push_action(Config::Action::default()));
+    }
+    history
+}
+
 fn criterion_benchmark<Config: BenchmarkConfig>(c: &mut Criterion<impl Measurement>) {
     let counts = [10, 100, 1000, 10000];
     {
@@ -90,16 +98,51 @@ fn criterion_benchmark<Config: BenchmarkConfig>(c: &mut Criterion<impl Measureme
         for &count in &counts {
             group.throughput(criterion::Throughput::Elements(count));
             group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-                let mut h = History::default();
-                for _ in 0..count {
-                    black_box(h.push_action(Config::Action::default()));
-                }
+                let h = filled_history::<Config>(count);
                 b.iter_batched_ref(
                     || h.clone(),
                     |h| {
                         for _ in 0..count {
                             black_box(h.pop_action());
                         }
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    {
+        // Removing every action, to compare against `pop_action` above at the same sizes.
+        let mut group = c.benchmark_group(format!("{}/pop_actions/all", Config::name()));
+        for &count in &counts {
+            group.throughput(criterion::Throughput::Elements(count));
+            group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+                let h = filled_history::<Config>(count);
+                b.iter_batched_ref(
+                    || h.clone(),
+                    |h| {
+                        black_box(h.pop_actions(count as usize));
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    {
+        // Removing only the most recent `k` of a fixed number of actions, where the *O*(*k* (1 +
+        // log (*n*/*k*))) cost of a single call is expected to beat `k` separate pops. Removing
+        // all of them is degenerate, because no cached state has to be recomputed, so every `k`
+        // here is strictly less than `n`.
+        let count = *counts.last().unwrap();
+        let mut group = c.benchmark_group(format!("{}/pop_actions/n={count}", Config::name()));
+        let h = filled_history::<Config>(count);
+        for k in [1, 10, 100, 1000] {
+            group.throughput(criterion::Throughput::Elements(k));
+            group.bench_with_input(BenchmarkId::from_parameter(k), &k, |b, &k| {
+                b.iter_batched_ref(
+                    || h.clone(),
+                    |h| {
+                        black_box(h.pop_actions(k as usize));
                     },
                     BatchSize::SmallInput,
                 );
@@ -135,7 +178,6 @@ mod count_measurement {
         Throughput,
         measurement::{Measurement, ValueFormatter},
     };
-    use rand::Rng;
     use std::{
         ops::{Add, Sub},
         sync::atomic::{AtomicU64, Ordering},
@@ -159,6 +201,7 @@ mod count_measurement {
                 Throughput::Bytes(n) => n,
                 Throughput::BytesDecimal(n) => n,
                 Throughput::Elements(n) => n,
+                Throughput::ElementsAndBytes { elements, .. } => elements,
             };
             let scale = (n as f64).recip();
             for v in values {
@@ -205,7 +248,7 @@ mod count_measurement {
 
     impl From<u64> for MeasurementValue {
         fn from(value: u64) -> Self {
-            Self(value, rand::rng().random())
+            Self(value, rand::random())
         }
     }
 

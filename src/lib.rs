@@ -101,8 +101,8 @@ pub enum RemoveActionError<A: Action> {
     ActionFailed { index: usize, error: A::Error },
 }
 
-/// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`], and
-/// [`History::try_pop_state`].
+/// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`],
+/// [`History::try_pop_state`], and [`History::try_pop_actions`].
 #[derive(thiserror::Error, Debug, PartialEq, Eq)]
 #[error("failed to apply action")]
 pub struct PopError<A: Action>(A::Error);
@@ -172,6 +172,19 @@ impl<A: Action> History<A> {
         }
         debug_assert!(index > 0);
         Some(index as usize)
+    }
+
+    // Returns the versions a history of `len` actions caches, ascending. This is the layout the
+    // incremental eviction in `cache_index_removed_at_version` maintains: counting `offset` up
+    // from the most recent version, each cached version is `len + 1` with its low `offset` bits
+    // cleared, minus `2^offset`. The oldest (`offset = ilog2(len + 1)`) is always version 0.
+    fn cached_versions_for_len(
+        len: usize,
+    ) -> impl IntoIterator<Item = usize, IntoIter: ExactSizeIterator> {
+        let bound = len + 1;
+        (0..bound.ilog2() as usize + 1)
+            .rev()
+            .map(move |offset| (bound >> offset << offset) - (1 << offset))
     }
 
     /// Adds a new action to the end of the history and returns the new version.
@@ -352,6 +365,77 @@ impl<A: Action> History<A> {
     ) -> Result<Option<A::State>, PopError<A>> {
         self.try_pop_action_and_state_with(context)
             .map(|o| o.map(|(_, s)| s))
+    }
+
+    /// Removes the most recent `k` actions.
+    ///
+    /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
+    /// there have been fewer than `k` actions. On error, the history is unchanged.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*k* (1 + log (*n*/*k*))) amortized time.
+    pub fn try_pop_actions_with(
+        &mut self,
+        k: usize,
+        context: &mut A::Context,
+    ) -> Result<Vec<A>, PopError<A>> {
+        let new_len = self.actions.len() - k.min(self.actions.len());
+
+        // Rebuild the cache for the truncated history directly: reuse every cached state already
+        // at a version the new cache needs and compute the missing ones from the nearest earlier
+        // state available, skipping the intermediate cache states `k` successive pops would
+        // compute and then discard. Computing states can fail, so it happens before any mutation.
+        let mut old_states = self.states.iter().peekable();
+        // The most recent cached state not after the current target.
+        let mut carry: Option<(usize, &A::State)> = None;
+        let mut computed: Vec<(usize, A::State)> = Vec::new();
+        for target in Self::cached_versions_for_len(new_len) {
+            while let Some((Version(version), state)) =
+                old_states.next_if(|&&(Version(version), _)| version <= target)
+            {
+                carry = Some((*version, state));
+            }
+            if carry.is_some_and(|(version, _)| version == target) {
+                continue;
+            }
+            let (base_version, base_state) = carry
+                .into_iter()
+                .chain(computed.last().map(|(version, state)| (*version, state)))
+                .max_by_key(|&(version, _)| version)
+                .expect("the initial state is always cached");
+            let state = A::apply_batch(
+                &self.actions[base_version..target],
+                base_state.clone(),
+                context,
+            )
+            .map_err(PopError)?;
+            computed.push((target, state));
+        }
+
+        // All mutation happens below, where nothing can fail: merge the reused and freshly
+        // computed states into the new cache and truncate the actions.
+        let targets = Self::cached_versions_for_len(new_len).into_iter();
+        let mut computed = computed.into_iter();
+        let mut old_states = std::mem::take(&mut self.states).into_iter().peekable();
+        let mut new_states = Vec::with_capacity(targets.len());
+        for target in targets {
+            let mut reused = None;
+            while let Some((Version(version), state)) =
+                old_states.next_if(|&(Version(version), _)| version <= target)
+            {
+                if version == target {
+                    reused = Some(state);
+                }
+            }
+            let state = match reused {
+                Some(state) => state,
+                None => computed.next().expect("missing states computed above").1,
+            };
+            new_states.push((Version(target), state));
+        }
+        self.states = new_states;
+        Ok(self.actions.drain(new_len..).rev().collect())
     }
 
     /// Shifts the action at `index` past every consecutive later action it commutes with and
@@ -805,9 +889,22 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_state_with(&mut self, context: &mut A::Context) -> Option<A::State> {
         self.try_pop_state_with(context)
+            .unwrap_or_else(|PopError(error)| match error {})
+    }
+
+    /// Removes the most recent `k` actions.
+    ///
+    /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
+    /// there have been fewer than `k` actions.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*k* (1 + log (*n*/*k*))) amortized time.
+    pub fn pop_actions_with(&mut self, k: usize, context: &mut A::Context) -> Vec<A> {
+        self.try_pop_actions_with(k, context)
             .unwrap_or_else(|PopError(error)| match error {})
     }
 
@@ -975,9 +1072,21 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_state(&mut self) -> Result<Option<A::State>, PopError<A>> {
         self.try_pop_state_with(&mut ())
+    }
+
+    /// Removes the most recent `k` actions.
+    ///
+    /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
+    /// there have been fewer than `k` actions. On error, the history is unchanged.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*k* (1 + log (*n*/*k*))) amortized time.
+    pub fn try_pop_actions(&mut self, k: usize) -> Result<Vec<A>, PopError<A>> {
+        self.try_pop_actions_with(k, &mut ())
     }
 
     /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
@@ -1142,9 +1251,21 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_state(&mut self) -> Option<A::State> {
         self.pop_state_with(&mut ())
+    }
+
+    /// Removes the most recent `k` actions.
+    ///
+    /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
+    /// there have been fewer than `k` actions.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*k* (1 + log (*n*/*k*))) amortized time.
+    pub fn pop_actions(&mut self, k: usize) -> Vec<A> {
+        self.pop_actions_with(k, &mut ())
     }
 
     /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
@@ -1295,6 +1416,39 @@ mod tests {
             prop_assert!(history.last_version() <= previous_version);
             prop_assert!(action.is_none() || history.last_version() < previous_version);
             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+        }
+
+        #[test]
+        fn pop_actions(history: History<TestAction>, k in 0usize..48) {
+            let mut singly = history.clone();
+            let mut history = history;
+            let popped = history.pop_actions_with(k, &mut ());
+
+            let mut expected = Vec::new();
+            for _ in 0..k {
+                let Some(action) = singly.pop_action() else { break };
+                expected.push(action);
+            }
+
+            prop_assert_eq!(popped, expected);
+            prop_assert_eq!(history.last_version(), singly.last_version());
+            prop_assert_eq!(history.cached_versions(), singly.cached_versions());
+            for version in history.versions() {
+                prop_assert_eq!(history.get_state(version), singly.get_state(version));
+            }
+        }
+
+        #[test]
+        fn cached_versions_for_len_matches_incremental(n in 0usize..256) {
+            let mut history = History::<TestAction>::default();
+            for i in 0..n {
+                history.push_action(TestAction((i % 256) as u8));
+            }
+            let expected: Vec<Version> = History::<TestAction>::cached_versions_for_len(n)
+                .into_iter()
+                .map(Version)
+                .collect();
+            prop_assert_eq!(history.cached_versions(), expected);
         }
 
         #[test]
