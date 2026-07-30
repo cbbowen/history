@@ -246,7 +246,7 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_action_and_state_with(
         &mut self,
         context: &mut A::Context,
@@ -310,7 +310,7 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_action_with(
         &mut self,
         context: &mut A::Context,
@@ -345,7 +345,7 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_state_with(
         &mut self,
         context: &mut A::Context,
@@ -743,7 +743,7 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_action_and_state_with(&mut self, context: &mut A::Context) -> Option<(A, A::State)> {
         self.try_pop_action_and_state_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
@@ -774,7 +774,7 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_action_with(&mut self, context: &mut A::Context) -> Option<A> {
         self.try_pop_action_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
@@ -917,7 +917,7 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_action_and_state(&mut self) -> Result<Option<(A, A::State)>, PopError<A>> {
         self.try_pop_action_and_state_with(&mut ())
     }
@@ -946,7 +946,7 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn try_pop_action(&mut self) -> Result<Option<A>, PopError<A>> {
         self.try_pop_action_with(&mut ())
     }
@@ -1084,7 +1084,7 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_action_and_state(&mut self) -> Option<(A, A::State)> {
         self.pop_action_and_state_with(&mut ())
     }
@@ -1113,7 +1113,7 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Takes *O*(log *n*) amortized time.
     pub fn pop_action(&mut self) -> Option<A> {
         self.pop_action_with(&mut ())
     }
