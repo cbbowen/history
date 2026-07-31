@@ -18,7 +18,11 @@ pub trait Action: Sized {
     ///
     /// Defaults to [`Infallible`](std::convert::Infallible), which unlocks the methods that
     /// return the result directly rather than a [`Result`].
-    type Error = std::convert::Infallible;
+    ///
+    /// This crate's error types report a value of this type as their
+    /// [`source`](std::error::Error::source), so their own [`Display`](std::fmt::Display) says
+    /// only which operation failed and leaves the reason to the chain.
+    type Error: std::error::Error + 'static = std::convert::Infallible;
 
     /// Which other actions this one commutes with, which is what lets the `remove_action` family
     /// avoid replaying the actions after the one it removes.
@@ -172,10 +176,7 @@ impl<A: Action> std::fmt::Display for PushError<A> {
     }
 }
 
-impl<A: Action + std::fmt::Debug> std::fmt::Debug for PushError<A>
-where
-    A::Error: std::fmt::Debug,
-{
+impl<A: Action + std::fmt::Debug> std::fmt::Debug for PushError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PushError")
             .field("action", &self.action)
@@ -195,8 +196,11 @@ where
 
 impl<A: Action + Eq> Eq for PushError<A> where A::Error: Eq {}
 
-impl<A: Action + std::fmt::Debug> std::error::Error for PushError<A> where A::Error: std::fmt::Debug
-{}
+impl<A: Action + std::fmt::Debug> std::error::Error for PushError<A> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
 
 /// The error type of [`History::try_get_state`] and [`History::try_get_state_with`].
 pub enum GetStateError<A: Action> {
@@ -216,10 +220,7 @@ impl<A: Action> std::fmt::Display for GetStateError<A> {
     }
 }
 
-impl<A: Action> std::fmt::Debug for GetStateError<A>
-where
-    A::Error: std::fmt::Debug,
-{
+impl<A: Action> std::fmt::Debug for GetStateError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::VersionOutOfRange(version) => {
@@ -245,7 +246,14 @@ where
 
 impl<A: Action> Eq for GetStateError<A> where A::Error: Eq {}
 
-impl<A: Action> std::error::Error for GetStateError<A> where A::Error: std::fmt::Debug {}
+impl<A: Action> std::error::Error for GetStateError<A> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::VersionOutOfRange(_) => None,
+            Self::ActionFailed(error) => Some(error),
+        }
+    }
+}
 
 /// The error type of [`History::try_remove_action`] and [`History::try_remove_action_with`].
 pub enum RemoveActionError<A: Action> {
@@ -272,10 +280,7 @@ impl<A: Action> std::fmt::Display for RemoveActionError<A> {
     }
 }
 
-impl<A: Action> std::fmt::Debug for RemoveActionError<A>
-where
-    A::Error: std::fmt::Debug,
-{
+impl<A: Action> std::fmt::Debug for RemoveActionError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IndexOutOfRange(index) => f.debug_tuple("IndexOutOfRange").field(index).finish(),
@@ -309,7 +314,14 @@ where
 
 impl<A: Action> Eq for RemoveActionError<A> where A::Error: Eq {}
 
-impl<A: Action> std::error::Error for RemoveActionError<A> where A::Error: std::fmt::Debug {}
+impl<A: Action> std::error::Error for RemoveActionError<A> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IndexOutOfRange(_) => None,
+            Self::ActionFailed { error, .. } => Some(error),
+        }
+    }
+}
 
 /// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`],
 /// [`History::try_pop_state`], and [`History::try_pop_actions`].
@@ -333,10 +345,7 @@ impl<A: Action> std::fmt::Display for PopError<A> {
     }
 }
 
-impl<A: Action> std::fmt::Debug for PopError<A>
-where
-    A::Error: std::fmt::Debug,
-{
+impl<A: Action> std::fmt::Debug for PopError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("PopError").field(&self.0).finish()
     }
@@ -353,7 +362,11 @@ where
 
 impl<A: Action> Eq for PopError<A> where A::Error: Eq {}
 
-impl<A: Action> std::error::Error for PopError<A> where A::Error: std::fmt::Debug {}
+impl<A: Action> std::error::Error for PopError<A> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 // What shortening a history removed.
 struct Popped<A: Action> {
@@ -1393,16 +1406,30 @@ mod tests {
         }
     }
 
+    /// The failure of a `None` action, used to exercise the fallible paths.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct NoAction;
+
+    impl std::fmt::Display for NoAction {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("there is no action to apply")
+        }
+    }
+
+    impl std::error::Error for NoAction {}
+
     impl Action for Option<TestAction> {
         type State = Vec<TestAction>;
-        type Error = ();
+        type Error = NoAction;
 
         fn apply(
             &self,
             state: Self::State,
             context: &mut Self::Context,
         ) -> Result<Self::State, Self::Error> {
-            let Some(action) = self else { return Err(()) };
+            let Some(action) = self else {
+                return Err(NoAction);
+            };
             action.apply(state, context).map_err(|e| match e {})
         }
     }
@@ -1794,6 +1821,14 @@ mod tests {
         #[derive(Debug, PartialEq, Eq)]
         struct OpaqueError;
 
+        impl std::fmt::Display for OpaqueError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the action refused to apply")
+            }
+        }
+
+        impl std::error::Error for OpaqueError {}
+
         /// Deliberately neither `Debug` nor `PartialEq`.
         struct Opaque(bool);
 
@@ -1820,6 +1855,68 @@ mod tests {
         assert_eq!(history.last_version(), Version(0));
         assert_eq!(history.last_version().index(), 0);
         assert_eq!(usize::from(history.last_version()), 0);
+    }
+
+    /// Every error that wraps a failed application must report it as its source, and say only
+    /// which operation failed itself, so a chain-walking reporter prints each exactly once.
+    #[test]
+    fn failed_applications_are_reported_as_the_source() {
+        use std::error::Error as _;
+
+        fn chain(error: &dyn std::error::Error) -> Vec<String> {
+            let mut chain = vec![error.to_string()];
+            let mut source = error.source();
+            while let Some(error) = source {
+                chain.push(error.to_string());
+                source = error.source();
+            }
+            chain
+        }
+
+        let mut history = History::<Option<TestAction>>::default();
+
+        let error = history.try_push_action(None).unwrap_err();
+        assert_eq!(
+            chain(&error),
+            ["failed to apply action", "there is no action to apply"]
+        );
+        assert!(error.source().unwrap().is::<NoAction>());
+
+        // A pop only fails when a replay does, which needs an action that succeeds once and then
+        // refuses, so the error is built directly rather than provoked.
+        let error = PopError::<Option<TestAction>>(NoAction);
+        assert_eq!(
+            chain(&error),
+            ["failed to apply action", "there is no action to apply"]
+        );
+
+        let error = RemoveActionError::<Option<TestAction>>::ActionFailed {
+            index: 3,
+            error: NoAction,
+        };
+        assert_eq!(
+            chain(&error),
+            ["failed to apply action", "there is no action to apply"]
+        );
+
+        let error = GetStateError::<Option<TestAction>>::ActionFailed(NoAction);
+        assert_eq!(
+            chain(&error),
+            ["failed to apply action", "there is no action to apply"]
+        );
+
+        // The out-of-range errors have nothing underneath them.
+        let error = History::<Option<TestAction>>::default()
+            .try_get_state(Version(1))
+            .unwrap_err();
+        assert_eq!(chain(&error), ["version out of range"]);
+        assert!(error.source().is_none());
+
+        let error = History::<Option<TestAction>>::default()
+            .try_remove_action(0)
+            .unwrap_err();
+        assert_eq!(chain(&error), ["action index out of range"]);
+        assert!(error.source().is_none());
     }
 
     #[test]
