@@ -1,4 +1,5 @@
 #![feature(associated_type_defaults)]
+#![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
@@ -6,8 +7,24 @@
 pub trait Action: Sized {
     /// The type of state this action affects.
     type State: Clone;
+
+    /// Anything applying an action needs that the history does not hold, such as a resource
+    /// pool or an interner. Every operation that can apply an action takes one by `&mut`.
+    ///
+    /// Defaults to `()`, which unlocks the shorter methods that do not take one at all.
     type Context = ();
+
+    /// The reason applying this action can fail.
+    ///
+    /// Defaults to [`Infallible`](std::convert::Infallible), which unlocks the methods that
+    /// return the result directly rather than a [`Result`].
     type Error = std::convert::Infallible;
+
+    /// Which other actions this one commutes with, which is what lets the `remove_action` family
+    /// avoid replaying the actions after the one it removes.
+    ///
+    /// Defaults to [`NonCommutative`], which never reports that anything commutes: always sound,
+    /// and never faster.
     type Centralizer<'a>: Centralizer<'a, Self> = NonCommutative;
 
     /// Applies this action to a state, producing a new state.
