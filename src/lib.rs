@@ -160,31 +160,109 @@ impl<A: Action> History<A> {
         (0..=self.actions.len()).map(Version)
     }
 
-    // Returns the index in the cache that will be removed at the given version.
-    fn cache_index_removed_at_version(Version(version): Version) -> Option<usize> {
-        if version == 0 {
-            return None;
-        }
-        let cache_len = version.ilog2();
-        let index = cache_len as i32 - (version + 1).trailing_zeros() as i32;
-        if index == -1 {
-            return None;
-        }
-        debug_assert!(index > 0);
-        Some(index as usize)
+    // The cache holds states at geometrically spaced versions, dense near the most recent version
+    // and sparse near the oldest. Rather than pinning each state to an exact version, it groups
+    // them into *windows*: window `scale` covers the versions whose distance from the most recent
+    // one lies in `2^scale..2^(scale + 1)`. Every window holds one or two states.
+    //
+    // The redundancy is what keeps stepping back and forth cheap. A layout pinned to the length
+    // of the history is a binary counter, so alternating a push with a pop re-propagates the same
+    // carry forever, rebuilding a state *O*(*n*) actions back on every cycle. Here a push only
+    // ever drops states a window can spare and a pop only rebuilds a window that has run empty,
+    // and a rebuilt state is placed in the middle of its window, so it survives another
+    // *O*(2^scale) operations in either direction before it must be rebuilt again.
+
+    // The number of windows a history of `len` actions has.
+    fn window_count(len: usize) -> u32 {
+        if len == 0 { 0 } else { len.ilog2() + 1 }
     }
 
-    // Returns the versions a history of `len` actions caches, ascending. This is the layout the
-    // incremental eviction in `cache_index_removed_at_version` maintains: counting `offset` up
-    // from the most recent version, each cached version is `len + 1` with its low `offset` bits
-    // cleared, minus `2^offset`. The oldest (`offset = ilog2(len + 1)`) is always version 0.
-    fn cached_versions_for_len(
-        len: usize,
-    ) -> impl IntoIterator<Item = usize, IntoIter: ExactSizeIterator> {
-        let bound = len + 1;
-        (0..bound.ilog2() as usize + 1)
-            .rev()
-            .map(move |offset| (bound >> offset << offset) - (1 << offset))
+    // The scale of the window holding the state at `version`, or `None` for the most recent
+    // state, which is always cached and belongs to no window.
+    fn window_of(Version(last): Version, Version(version): Version) -> Option<u32> {
+        let distance = last - version;
+        (distance > 0).then(|| distance.ilog2())
+    }
+
+    // Drops every cached state whose window still holds a state on either side of it, leaving the
+    // nearest and furthest state of each window: under a push those two are, respectively, the
+    // last to leave the window, and under a pop the same holds in reverse. Performs no action
+    // applications and no state clones.
+    fn prune_cache(&mut self) {
+        let last = self.last_version();
+        let mut previous = None;
+        let mut write = 0;
+        for read in 0..self.states.len() {
+            let scale = Self::window_of(last, self.states[read].0);
+            let next = self
+                .states
+                .get(read + 1)
+                .and_then(|(version, _)| Self::window_of(last, *version));
+            // Reading ahead is sound because nothing past `read` has been overwritten yet, and
+            // `previous` carries the scale the entry before `read` had before it moved.
+            let redundant = scale.is_some() && previous == scale && scale == next;
+            previous = scale;
+            if !redundant {
+                self.states.swap(write, read);
+                write += 1;
+            }
+        }
+        self.states.truncate(write);
+    }
+
+    // Returns the states that must be added to `states` for it to cache a history of `new_len`
+    // actions, ascending by version. `replay` must carry a state from one version of the *new*
+    // history to a later one.
+    //
+    // Every action application a cache repair needs happens here, so a caller can run this before
+    // touching the history and leave it untouched if an application fails.
+    fn plan_refill(
+        states: &[(Version, A::State)],
+        new_len: usize,
+        mut replay: impl FnMut(usize, usize, A::State, &mut A::Context) -> Result<A::State, A::Error>,
+        context: &mut A::Context,
+    ) -> Result<Vec<(Version, A::State)>, A::Error> {
+        let mut plan: Vec<(Version, A::State)> = Vec::new();
+
+        // The most recent state must always be cached: `last_state` hands it out directly.
+        if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
+            let (Version(base), state) = states.last().expect("the initial state is always cached");
+            let state = replay(*base, new_len, state.clone(), context)?;
+            plan.push((Version(new_len), state));
+        }
+
+        // Fill the windows from the coarsest to the finest so that each refill can replay from a
+        // state an earlier iteration already planned. The coarsest window always holds the
+        // initial state, so the body never runs for it and the midpoint below cannot underflow.
+        for scale in (0..Self::window_count(new_len)).rev() {
+            let occupies =
+                |(Version(version), _): &(Version, A::State)| (new_len - *version) >> scale == 1;
+            if states.iter().any(occupies) || plan.iter().any(occupies) {
+                continue;
+            }
+            let target = new_len - ((3 << scale) >> 1);
+            let (Version(base), state) = states
+                .iter()
+                .chain(plan.iter())
+                .filter(|(Version(version), _)| *version <= target)
+                .max_by_key(|(version, _)| *version)
+                .expect("the initial state is always cached");
+            let state = replay(*base, target, state.clone(), context)?;
+            plan.push((Version(target), state));
+        }
+
+        plan.sort_by_key(|(version, _)| *version);
+        Ok(plan)
+    }
+
+    // Replaces the cached states after the first `keep` with `plan` and drops the ones the result
+    // makes redundant. Must run after the actions have been updated, so that window scales are
+    // measured against the new most recent version.
+    fn install_refill(&mut self, keep: usize, plan: Vec<(Version, A::State)>) {
+        self.states.truncate(keep);
+        self.states.extend(plan);
+        self.states.sort_by_key(|(version, _)| *version);
+        self.prune_cache();
     }
 
     /// Adds a new action to the end of the history and returns the new version.
@@ -209,7 +287,7 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping.
     pub fn try_push_action_with(
         &mut self,
         action: A,
@@ -220,16 +298,12 @@ impl<A: Action> History<A> {
             Err(error) => return Err(PushError { action, error }),
         };
         self.actions.push(action);
-
-        // Determine which state will be removed.
         let new_version = Version(self.actions.len());
-        if let Some(index_to_remove) = Self::cache_index_removed_at_version(new_version) {
-            // This takes `O(k)` time but `k` is exponentially-distributed, so amortized, it is
-            // `O(1)`.
-            self.states.remove(index_to_remove);
-        }
-
         self.states.push((new_version, new_state));
+
+        // The state that was most recent lands in the finest window, so a push never leaves a
+        // window empty and never has to replay anything; it only drops states a window can spare.
+        self.prune_cache();
         Ok(new_version)
     }
 
@@ -259,42 +333,36 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_action_and_state_with(
         &mut self,
         context: &mut A::Context,
     ) -> Result<Option<(A, A::State)>, PopError<A>> {
-        let removed_version = self.actions.len();
-        let new_version_and_state = Self::cache_index_removed_at_version(Version(removed_version))
-            .map(|new_index| {
-                let new_version = removed_version + 1 - (1 << (self.states.len() - new_index));
-                let (Version(recent_version), state) = self.get_cached_state(new_index - 1);
-                let state = A::apply_batch(
-                    &self.actions[recent_version..new_version],
-                    state.clone(),
-                    context,
-                );
-                state.map(|s| (new_index, (Version(new_version), s)))
-            });
-        let new_version_and_state = new_version_and_state.transpose().map_err(PopError)?;
-
-        // Infallible because it does not perform any action applications. All mutation must
-        // happen here.
-        let infallible_portion = move || {
-            let popped_action = self.actions.pop()?;
-            let (_, popped_state) = self
-                .states
-                .pop()
-                .expect("state/action size match invariant");
-
-            if let Some((new_index, new_version_and_state)) = new_version_and_state {
-                self.states.insert(new_index, new_version_and_state);
-            }
-
-            Some((popped_action, popped_state))
+        let Some(new_len) = self.actions.len().checked_sub(1) else {
+            return Ok(None);
         };
 
-        Ok(infallible_portion())
+        // The popped state is the only cached state the shorter history cannot keep. Every
+        // application happens here, before any mutation, so a failure leaves the history
+        // unchanged.
+        let keep = self.states.len() - 1;
+        let plan = Self::plan_refill(
+            &self.states[..keep],
+            new_len,
+            |from, to, state, context| A::apply_batch(&self.actions[from..to], state, context),
+            context,
+        )
+        .map_err(PopError)?;
+
+        // All mutation happens below and is infallible.
+        let popped_action = self.actions.pop().expect("checked above");
+        let (_, popped_state) = self
+            .states
+            .pop()
+            .expect("state/action size match invariant");
+        self.install_refill(keep, plan);
+        Ok(Some((popped_action, popped_state)))
     }
 
     /// Removes and returns the most recent action.
@@ -323,7 +391,8 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_action_with(
         &mut self,
         context: &mut A::Context,
@@ -358,7 +427,8 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_state_with(
         &mut self,
         context: &mut A::Context,
@@ -382,60 +452,25 @@ impl<A: Action> History<A> {
     ) -> Result<Vec<A>, PopError<A>> {
         let new_len = self.actions.len() - k.min(self.actions.len());
 
-        // Rebuild the cache for the truncated history directly: reuse every cached state already
-        // at a version the new cache needs and compute the missing ones from the nearest earlier
-        // state available, skipping the intermediate cache states `k` successive pops would
-        // compute and then discard. Computing states can fail, so it happens before any mutation.
-        let mut old_states = self.states.iter().peekable();
-        // The most recent cached state not after the current target.
-        let mut carry: Option<(usize, &A::State)> = None;
-        let mut computed: Vec<(usize, A::State)> = Vec::new();
-        for target in Self::cached_versions_for_len(new_len) {
-            while let Some((Version(version), state)) =
-                old_states.next_if(|&&(Version(version), _)| version <= target)
-            {
-                carry = Some((*version, state));
-            }
-            if carry.is_some_and(|(version, _)| version == target) {
-                continue;
-            }
-            let (base_version, base_state) = carry
-                .into_iter()
-                .chain(computed.last().map(|(version, state)| (*version, state)))
-                .max_by_key(|&(version, _)| version)
-                .expect("the initial state is always cached");
-            let state = A::apply_batch(
-                &self.actions[base_version..target],
-                base_state.clone(),
-                context,
-            )
-            .map_err(PopError)?;
-            computed.push((target, state));
-        }
+        // Keep every cached state the shorter history can still use and rebuild only the windows
+        // that running the end backwards leaves empty, skipping the states `k` successive pops
+        // would compute and then discard. Computing states can fail, so it all happens before any
+        // mutation.
+        let keep = self
+            .states
+            .partition_point(|(Version(version), _)| *version <= new_len);
+        let plan = Self::plan_refill(
+            &self.states[..keep],
+            new_len,
+            |from, to, state, context| A::apply_batch(&self.actions[from..to], state, context),
+            context,
+        )
+        .map_err(PopError)?;
 
-        // All mutation happens below, where nothing can fail: merge the reused and freshly
-        // computed states into the new cache and truncate the actions.
-        let targets = Self::cached_versions_for_len(new_len).into_iter();
-        let mut computed = computed.into_iter();
-        let mut old_states = std::mem::take(&mut self.states).into_iter().peekable();
-        let mut new_states = Vec::with_capacity(targets.len());
-        for target in targets {
-            let mut reused = None;
-            while let Some((Version(version), state)) =
-                old_states.next_if(|&(Version(version), _)| version <= target)
-            {
-                if version == target {
-                    reused = Some(state);
-                }
-            }
-            let state = match reused {
-                Some(state) => state,
-                None => computed.next().expect("missing states computed above").1,
-            };
-            new_states.push((Version(target), state));
-        }
-        self.states = new_states;
-        Ok(self.actions.drain(new_len..).rev().collect())
+        // All mutation happens below and is infallible.
+        let popped = self.actions.drain(new_len..).rev().collect();
+        self.install_refill(keep, plan);
+        Ok(popped)
     }
 
     /// Shifts the action at `index` past every consecutive later action it commutes with and
@@ -575,108 +610,36 @@ impl<A: Action> History<A> {
         // need to be replayed.
         let index = self.shift_late(index, context)?;
 
-        // The cache transformation is the one a pop from `last_version` performs: the entry at
-        // `last_version` is dropped and one previously evicted entry may be reinserted. In
-        // addition, every cached state after `index` must be rebuilt without the removed action
-        // by replaying the actions after `index`. Every fallible action application happens
-        // before any mutation, so on error the action is still at `index`.
-        let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
-        let last_cache_index = self.states.len() - 1;
-        let reinserted =
-            Self::cache_index_removed_at_version(Version(last_version)).map(|cache_index| {
-                (
-                    cache_index,
-                    last_version + 1 - (1 << (self.states.len() - cache_index)),
-                )
-            });
-
-        let mut fixed_states = Vec::with_capacity(last_cache_index - first_affected);
-        let mut reinserted_state = None;
-
-        // A previously evicted entry at or before `index` is unaffected by the removal, so
-        // reconstruct it from the old states, exactly as a pop would.
-        if let Some((cache_index, reinserted_version)) = reinserted
-            && reinserted_version <= index
-        {
-            let (Version(recent_version), state) = &self.states[cache_index - 1];
-            let state = A::apply_batch(
-                &self.actions[*recent_version..reinserted_version],
-                state.clone(),
-                context,
-            );
-            match state {
-                Ok(state) => reinserted_state = Some(state),
-                Err(error) => {
-                    return Err(RemoveActionError::ActionFailed { index, error });
-                }
-            }
-        }
-
-        // Replay the actions after `index` over the state at `index`, recording the states the
-        // new cache needs: one per cached version in `(index, last_version)`, plus the
-        // reinserted version if it lies after `index`. In the new history, the state at such a
-        // version `v` is the actions at old positions `index + 1..=v` applied to the state at
-        // `index`.
-        let replayed_reinserted_version = reinserted
-            .map(|(_, version)| version)
-            .filter(|version| *version > index);
-        if first_affected < last_cache_index || replayed_reinserted_version.is_some() {
-            // The reinserted version was evicted from the cache, so it never duplicates a cached
-            // version.
-            let mut replay_targets: Vec<(usize, bool)> = self.states
-                [first_affected..last_cache_index]
-                .iter()
-                .map(|(Version(v), _)| (*v, false))
-                .collect();
-            if let Some(version) = replayed_reinserted_version {
-                let position = replay_targets.partition_point(|(v, _)| *v < version);
-                replay_targets.insert(position, (version, true));
-            }
-
-            let mut state = match self.try_get_state_with(Version(index), context) {
-                Ok(state) => state,
-                // Unreachable: `index` is in range, so `Version(index)` is too.
-                Err(GetStateError::VersionOutOfRange(_)) => {
-                    return Err(RemoveActionError::IndexOutOfRange(index));
-                }
-                Err(GetStateError::ActionFailed(error)) => {
-                    return Err(RemoveActionError::ActionFailed { index, error });
-                }
-            };
-            let mut version = index;
-            for (target_version, is_reinserted) in replay_targets {
-                state = match A::apply_batch(
-                    &self.actions[version + 1..=target_version],
-                    state,
-                    context,
-                ) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        return Err(RemoveActionError::ActionFailed { index, error });
-                    }
-                };
-                version = target_version;
-                if is_reinserted {
-                    reinserted_state = Some(state.clone());
+        // Cached states at or before `index` survive the removal untouched; the ones after it
+        // describe a history that no longer exists and are rebuilt by replaying without the
+        // removed action. Every fallible action application happens before any mutation, so on
+        // error the action is still at `index`.
+        let keep = self
+            .states
+            .partition_point(|(Version(version), _)| *version <= index);
+        let plan = Self::plan_refill(
+            &self.states[..keep],
+            last_version - 1,
+            |from, to, state, context| {
+                // Version `v` of the shortened history is reached by the action at position `v`
+                // while before `index` and by the one at `v + 1` from `index` on, so a replay
+                // spans at most two runs of the actions as they stand now.
+                let split = index.clamp(from, to);
+                let state = A::apply_batch(&self.actions[from..split], state, context)?;
+                let tail = from.max(index);
+                if tail < to {
+                    A::apply_batch(&self.actions[tail + 1..to + 1], state, context)
                 } else {
-                    fixed_states.push(state.clone());
+                    Ok(state)
                 }
-            }
-        }
+            },
+            context,
+        )
+        .map_err(|error| RemoveActionError::ActionFailed { index, error })?;
 
         // All mutation happens below and is infallible.
         let action = self.actions.remove(index);
-        for (offset, state) in fixed_states.into_iter().enumerate() {
-            self.states[first_affected + offset].1 = state;
-        }
-        self.states
-            .pop()
-            .expect("state/action size match invariant");
-        if let Some((cache_index, reinserted_version)) = reinserted {
-            let state = reinserted_state.expect("reinserted state is computed above");
-            self.states
-                .insert(cache_index, (Version(reinserted_version), state));
-        }
+        self.install_refill(keep, plan);
         Ok(action)
     }
 
@@ -734,15 +697,29 @@ impl<A: Action> History<A> {
             .cloned()
             .collect()
     }
-}
 
-trait ResultExt<T> {
-    fn unwrap_or_infallible(self) -> T;
-}
-
-impl<T> ResultExt<T> for Result<T, std::convert::Infallible> {
-    fn unwrap_or_infallible(self) -> T {
-        self.unwrap_or_else(|error| match error {})
+    /// Panics unless the cache is in the shape every operation must leave it in: strictly
+    /// ascending, holding the initial and most recent states, and one or two states per window.
+    /// The upper bound is what keeps the cache *O*(log *n*); the lower bound is what keeps
+    /// [`Self::try_get_state_with`] linear in the distance back to the requested version.
+    #[cfg(test)]
+    pub(crate) fn assert_cache_invariant(&self) {
+        let last = self.last_version();
+        assert_eq!(self.states.first().map(|(v, _)| *v), Some(Version(0)));
+        assert_eq!(self.states.last().map(|(v, _)| *v), Some(last));
+        assert!(self.states.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for scale in 0..Self::window_count(last.0) {
+            let occupancy = self
+                .states
+                .iter()
+                .filter(|(version, _)| Self::window_of(last, *version) == Some(scale))
+                .count();
+            assert!(
+                (1..=2).contains(&occupancy),
+                "window {scale} holds {occupancy} states at {last:?}: {:?}",
+                self.cached_versions()
+            );
+        }
     }
 }
 
@@ -768,38 +745,13 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping.
     pub fn push_action_with(&mut self, action: A, context: &mut A::Context) -> Version {
-        // The implementaiton below is morally equivalent to:
-        // ```
-        // self.try_push_action_with(action, context)
-        //     .unwrap_or_else(|PushError { error, .. }| match error {});
-        // ```
-        // However, we can avoid a clone half the time.
-
-        // Determine which state will be removed.
-        self.actions.push(action);
-        let new_version = Version(self.actions.len());
-        let index_to_remove = Self::cache_index_removed_at_version(new_version);
-
-        // If it's the last state, pop it instead of cloning then removing.
-        let last_state = if index_to_remove.is_some_and(|i| i + 1 == self.states.len()) {
-            self.states.pop().expect("non-empty").1
-        } else {
-            if let Some(index_to_remove) = index_to_remove {
-                self.states.remove(index_to_remove);
-            }
-            self.states.last().expect("non-empty").1.clone()
-        };
-
-        let new_state = self
-            .actions
-            .last()
-            .expect("non-empty")
-            .apply(last_state, context)
-            .unwrap_or_infallible();
-        self.states.push((new_version, new_state));
-        new_version
+        // The state a push displaces from the end always stays cached — it is what lets the next
+        // pop replay nothing — so, unlike a layout that evicts it, there is no clone to avoid
+        // here and nothing to gain over the fallible implementation.
+        self.try_push_action_with(action, context)
+            .unwrap_or_else(|PushError { error, .. }| match error {})
     }
 
     /// Removes and returns the most recent action and the state it produced.
@@ -827,7 +779,8 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_action_and_state_with(&mut self, context: &mut A::Context) -> Option<(A, A::State)> {
         self.try_pop_action_and_state_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
@@ -858,7 +811,8 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_action_with(&mut self, context: &mut A::Context) -> Option<A> {
         self.try_pop_action_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
@@ -889,7 +843,8 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_state_with(&mut self, context: &mut A::Context) -> Option<A::State> {
         self.try_pop_state_with(context)
             .unwrap_or_else(|PopError(error)| match error {})
@@ -985,7 +940,7 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping.
     pub fn try_push_action(&mut self, action: A) -> Result<Version, PushError<A>> {
         self.try_push_action_with(action, &mut ())
     }
@@ -1014,7 +969,8 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_action_and_state(&mut self) -> Result<Option<(A, A::State)>, PopError<A>> {
         self.try_pop_action_and_state_with(&mut ())
     }
@@ -1043,7 +999,8 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_action(&mut self) -> Result<Option<A>, PopError<A>> {
         self.try_pop_action_with(&mut ())
     }
@@ -1072,7 +1029,8 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn try_pop_state(&mut self) -> Result<Option<A::State>, PopError<A>> {
         self.try_pop_state_with(&mut ())
     }
@@ -1164,7 +1122,7 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(1) amortized time.
+    /// Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping.
     pub fn push_action(&mut self, action: A) -> Version {
         self.push_action_with(action, &mut ())
     }
@@ -1193,7 +1151,8 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_action_and_state(&mut self) -> Option<(A, A::State)> {
         self.pop_action_and_state_with(&mut ())
     }
@@ -1222,7 +1181,8 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_action(&mut self) -> Option<A> {
         self.pop_action_with(&mut ())
     }
@@ -1251,7 +1211,8 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Takes *O*(log *n*) amortized time.
+    /// Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops
+    /// replay nothing at all: the state they need is the one the push before them displaced.
     pub fn pop_state(&mut self) -> Option<A::State> {
         self.pop_state_with(&mut ())
     }
@@ -1344,6 +1305,26 @@ mod tests {
         }
     }
 
+    /// A [`TestAction`] that tallies its applications in the context, so that tests can assert on
+    /// how much replaying an operation actually does.
+    #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
+    struct CountedAction(u8);
+
+    impl Action for CountedAction {
+        type State = Vec<CountedAction>;
+        type Context = usize;
+
+        fn apply(
+            &self,
+            mut state: Self::State,
+            applications: &mut usize,
+        ) -> Result<Self::State, Self::Error> {
+            *applications += 1;
+            state.push(*self);
+            Ok(state)
+        }
+    }
+
     impl Action for Option<TestAction> {
         type State = Vec<TestAction>;
         type Error = ();
@@ -1430,25 +1411,81 @@ mod tests {
                 expected.push(action);
             }
 
+            // The two agree on everything observable. The cached versions need not match: the
+            // layout depends on how the history got to its length, not only on the length.
             prop_assert_eq!(popped, expected);
             prop_assert_eq!(history.last_version(), singly.last_version());
-            prop_assert_eq!(history.cached_versions(), singly.cached_versions());
             for version in history.versions() {
                 prop_assert_eq!(history.get_state(version), singly.get_state(version));
             }
+            history.assert_cache_invariant();
+            singly.assert_cache_invariant();
         }
 
+        /// Every operation must leave the cache in shape, whatever order they come in.
         #[test]
-        fn cached_versions_for_len_matches_incremental(n in 0usize..256) {
+        fn cache_invariant_under_interleaving(steps: Vec<Step<TestAction>>) {
             let mut history = History::<TestAction>::default();
-            for i in 0..n {
-                history.push_action(TestAction((i % 256) as u8));
+            history.assert_cache_invariant();
+            for step in steps {
+                match step {
+                    Step::Push(action) => { history.push_action(action); }
+                    Step::Pop => { history.pop_action(); }
+                }
+                history.assert_cache_invariant();
             }
-            let expected: Vec<Version> = History::<TestAction>::cached_versions_for_len(n)
-                .into_iter()
-                .map(Version)
-                .collect();
-            prop_assert_eq!(history.cached_versions(), expected);
+        }
+
+        /// Alternating a push with a pop must not rebuild anything: the state a push displaces
+        /// from the end is exactly the one the pop after it needs back. A layout pinned to the
+        /// length of the history fails this, replaying *O*(*n*) actions per cycle at the lengths
+        /// that straddle a carry.
+        #[test]
+        fn alternating_push_and_pop_replays_nothing(n in 0usize..600, cycles in 1usize..8) {
+            let mut applications = 0;
+            let mut history = History::<CountedAction>::default();
+            for i in 0..n {
+                history.push_action_with(CountedAction((i % 256) as u8), &mut applications);
+            }
+
+            applications = 0;
+            for _ in 0..cycles {
+                history.push_action_with(CountedAction(0), &mut applications);
+                history.pop_action_with(&mut applications);
+                history.assert_cache_invariant();
+                prop_assert_eq!(history.last_version(), Version(n));
+            }
+
+            // Only the applications the pushes themselves need; the pops replay nothing at all.
+            prop_assert_eq!(applications, cycles);
+        }
+
+        /// Popping in bulk skips the cache states `k` successive pops compute and then discard, so
+        /// it can only ever fall behind by the handful of windows it refills that they did not.
+        #[test]
+        fn pop_actions_costs_no_more_than_repeated_pops(n in 0usize..600, k in 0usize..600) {
+            let mut applications = 0;
+            let mut history = History::<CountedAction>::default();
+            for i in 0..n {
+                history.push_action_with(CountedAction((i % 256) as u8), &mut applications);
+            }
+            let mut singly = history.clone();
+
+            applications = 0;
+            history.pop_actions_with(k, &mut applications);
+            let bulk = applications;
+
+            applications = 0;
+            for _ in 0..k.min(n) {
+                singly.pop_action_with(&mut applications);
+            }
+
+            let allowance = History::<CountedAction>::window_count(n) as usize;
+            prop_assert!(
+                bulk <= applications + allowance,
+                "bulk {bulk} exceeds {applications} one at a time by more than {allowance}",
+            );
+            history.assert_cache_invariant();
         }
 
         #[test]
@@ -1540,15 +1577,16 @@ mod tests {
             );
             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), expected_actions.clone());
 
-            // The history must be indistinguishable from one built from the remaining actions.
+            // The history must be indistinguishable from one built from the remaining actions,
+            // apart from its cache layout, which depends on how it reached its current length.
             let mut expected = History::new([0; SLOT_COUNT]);
             for action in &expected_actions {
                 expected.push_action(*action);
             }
-            prop_assert_eq!(history.cached_versions(), expected.cached_versions());
             for version in history.versions() {
                 prop_assert_eq!(history.get_state(version), expected.get_state(version));
             }
+            history.assert_cache_invariant();
         }
 
         #[test]
@@ -1614,6 +1652,70 @@ mod tests {
                 prop_assert!(!must_succeed);
             }
             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+        }
+    }
+
+    /// A bulk pop rebuilds only the cache the shortened history ends up with, so unlike a run of
+    /// single pops its cost does not grow with `k`.
+    #[test]
+    fn pop_actions_scales_better_than_repeated_pops() {
+        for n in [64usize, 256, 1024, 4096] {
+            let mut applications = 0;
+            let mut history = History::<CountedAction>::default();
+            for i in 0..n {
+                history.push_action_with(CountedAction((i % 256) as u8), &mut applications);
+            }
+            let mut singly = history.clone();
+
+            applications = 0;
+            history.pop_actions_with(n / 2, &mut applications);
+            let bulk = applications;
+
+            applications = 0;
+            for _ in 0..n / 2 {
+                singly.pop_action_with(&mut applications);
+            }
+
+            // The margin grows with `n`; two is what the smallest size here already clears.
+            assert!(
+                bulk * 2 < applications,
+                "at n = {n}, popping {} in bulk applied {bulk} actions against {applications} \
+                 one at a time",
+                n / 2,
+            );
+            history.assert_cache_invariant();
+            for version in history.versions() {
+                assert_eq!(
+                    history.get_state_with(version, &mut 0),
+                    singly.get_state_with(version, &mut 0),
+                    "at n = {n}, {version:?}",
+                );
+            }
+        }
+    }
+
+    /// Pins the behaviour at the lengths a layout pinned to the length of the history handles
+    /// worst: those where `n + 1` is `3 * 2^(scale - 1)`, so that a push and the pop undoing it
+    /// straddle a carry and the rigid layout rebuilds a state `2^(scale - 1)` actions back on
+    /// every single cycle.
+    #[test]
+    fn alternation_is_cheap_at_pathological_lengths() {
+        const CYCLES: usize = 64;
+        for n in [10, 22, 46, 94, 190, 382, 766, 1534, 3070] {
+            let mut applications = 0;
+            let mut history = History::<CountedAction>::default();
+            for i in 0..n {
+                history.push_action_with(CountedAction((i % 256) as u8), &mut applications);
+            }
+
+            applications = 0;
+            for _ in 0..CYCLES {
+                history.push_action_with(CountedAction(0), &mut applications);
+                history.pop_action_with(&mut applications);
+            }
+
+            history.assert_cache_invariant();
+            assert_eq!(applications, CYCLES, "at n = {n}");
         }
     }
 
