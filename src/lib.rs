@@ -338,6 +338,14 @@ impl<A: Action> Eq for PopError<A> where A::Error: Eq {}
 
 impl<A: Action> std::error::Error for PopError<A> where A::Error: std::fmt::Debug {}
 
+// What shortening a history removed.
+struct Popped<A: Action> {
+    // The removed actions, most recent first.
+    actions: Vec<A>,
+    // The state the most recent removed action produced, absent only when nothing was removed.
+    state: Option<A::State>,
+}
+
 /// The history of state as actions are applied to it.
 #[derive(Debug, Clone)]
 pub struct History<A: Action> {
@@ -372,7 +380,7 @@ impl<A: Action> History<A> {
     pub fn new(initial: A::State) -> Self {
         Self {
             actions: Vec::new(),
-            states: [(Version::default(), initial)].into_iter().collect(),
+            states: vec![(Version(0), initial)],
         }
     }
 
@@ -591,27 +599,10 @@ impl<A: Action> History<A> {
         let Some(new_len) = self.actions.len().checked_sub(1) else {
             return Ok(None);
         };
-
-        // The popped state is the only cached state the shorter history cannot keep. Every
-        // application happens here, before any mutation, so a failure leaves the history
-        // unchanged.
-        let keep = self.states.len() - 1;
-        let plan = Self::plan_refill(
-            &self.states[..keep],
-            new_len,
-            |from, to, state, context| A::apply_batch(&self.actions[from..to], state, context),
-            context,
-        )
-        .map_err(PopError)?;
-
-        // All mutation happens below and is infallible.
-        let popped_action = self.actions.pop().expect("checked above");
-        let (_, popped_state) = self
-            .states
-            .pop()
-            .expect("state/action size match invariant");
-        self.install_refill(keep, plan);
-        Ok(Some((popped_action, popped_state)))
+        let Popped { mut actions, state } = self.pop_to(new_len, context)?;
+        let action = actions.pop().expect("exactly one action was removed");
+        let state = state.expect("the most recent state is always cached");
+        Ok(Some((action, state)))
     }
 
     /// Removes and returns the most recent action.
@@ -699,12 +690,22 @@ impl<A: Action> History<A> {
         k: usize,
         context: &mut A::Context,
     ) -> Result<Vec<A>, PopError<A>> {
-        let new_len = self.actions.len() - k.min(self.actions.len());
+        let new_len = self.actions.len().saturating_sub(k);
+        Ok(self.pop_to(new_len, context)?.actions)
+    }
 
+    // Shortens the history to `new_len` actions, returning them in reverse order along with the
+    // state the most recent one produced, or `None` if nothing was removed.
+    //
+    // Every action application happens before any mutation, so on error the history is unchanged.
+    fn pop_to(
+        &mut self,
+        new_len: usize,
+        context: &mut A::Context,
+    ) -> Result<Popped<A>, PopError<A>> {
         // Keep every cached state the shorter history can still use and rebuild only the windows
-        // that running the end backwards leaves empty, skipping the states `k` successive pops
-        // would compute and then discard. Computing states can fail, so it all happens before any
-        // mutation.
+        // that running the end backwards leaves empty. When several actions go at once, that
+        // skips the states the same number of successive pops would compute and then discard.
         let keep = self
             .states
             .partition_point(|(Version(version), _)| *version <= new_len);
@@ -716,10 +717,18 @@ impl<A: Action> History<A> {
         )
         .map_err(PopError)?;
 
-        // All mutation happens below and is infallible.
-        let popped = self.actions.drain(new_len..).rev().collect();
+        // All mutation happens below and is infallible. The most recent state is always cached,
+        // so if anything is coming off at all it is sitting at the end of the cache.
+        let state = if keep < self.states.len() {
+            let (version, state) = self.states.pop().expect("`keep` is a smaller index");
+            debug_assert_eq!(version, self.last_version());
+            Some(state)
+        } else {
+            None
+        };
+        let actions = self.actions.drain(new_len..).rev().collect();
         self.install_refill(keep, plan);
-        Ok(popped)
+        Ok(Popped { actions, state })
     }
 
     /// Shifts the action at `index` past every consecutive later action it commutes with and
@@ -897,56 +906,44 @@ impl<A: Action> History<A> {
         Version(self.actions.len())
     }
 
-    fn get_cached_state(&self, state_index: usize) -> (Version, &A::State) {
-        let (version, state) = self.states.get(state_index).unwrap();
-        (*version, state)
-    }
-
-    /// Returns the most recent cached state not after the given `version` or an error if no such
-    /// cached state exists.
-    fn get_recent_state_index(&self, version: Version) -> Result<usize, GetStateError<A>> {
-        if version > self.last_version() {
-            return Err(GetStateError::VersionOutOfRange(version));
-        }
-        let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
-        Ok(index)
-    }
-
     /// Returns the most recent state.
     ///
     /// # Time complexity
     ///
     /// Takes *O*(1) time.
     pub fn last_state(&self) -> &A::State {
-        let (version, state) = self.states.last().unwrap();
+        let (version, state) = self
+            .states
+            .last()
+            .expect("the initial state is always cached");
         debug_assert_eq!(*version, self.last_version());
         state
     }
 
     /// Returns the state at the specified version.
+    ///
+    /// # Time complexity
+    ///
+    /// Takes *O*(*k* + log *n*) time, where *k* is how far back `version` is.
     pub fn try_get_state_with(
         &self,
         version: Version,
         context: &mut A::Context,
     ) -> Result<A::State, GetStateError<A>> {
-        let state_index = self.get_recent_state_index(version)?;
-        let (recent_version, state) = self.get_cached_state(state_index);
-        A::apply_batch(
-            &self.actions[recent_version.0..version.0],
-            state.clone(),
-            context,
-        )
-        .map_err(GetStateError::ActionFailed)
+        if version > self.last_version() {
+            return Err(GetStateError::VersionOutOfRange(version));
+        }
+        // The initial state is always cached, so the partition is never empty.
+        let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
+        let (Version(cached), state) = &self.states[index];
+        A::apply_batch(&self.actions[*cached..version.0], state.clone(), context)
+            .map_err(GetStateError::ActionFailed)
     }
 
     /// Returns the versions of the cached states.
     #[cfg(test)]
     pub(crate) fn cached_versions(&self) -> Vec<Version> {
-        self.states
-            .iter()
-            .map(|(version, _)| version)
-            .cloned()
-            .collect()
+        self.states.iter().map(|&(version, _)| version).collect()
     }
 
     /// Panics unless the cache is in the shape every operation must leave it in: strictly
@@ -1626,7 +1623,7 @@ mod tests {
         fn push_action(mut history: History<TestAction>, action: TestAction) {
             let previous_version = history.last_version();
             let mut actions = Vec::from_iter(history.actions().cloned());
-            let new_version = history.push_action(action.clone());
+            let new_version = history.push_action(action);
 
             // This test only verifies the actions and last version are updated appropriately, not the
             // states. The consistency of the states with the actions is covered by other tests.
@@ -1880,7 +1877,7 @@ mod tests {
             let previous_version = history.last_version();
             let mut actions = Vec::from_iter(history.actions().cloned());
             let must_succeed = actions.iter().all(|a| a.is_some()) && action.is_some();
-            if let Ok(new_version) = history.try_push_action(action.clone()) {
+            if let Ok(new_version) = history.try_push_action(action) {
                 prop_assert_eq!(history.last_version(), new_version);
                 prop_assert!(new_version > previous_version);
                 actions.push(action);
