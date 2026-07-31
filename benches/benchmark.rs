@@ -37,6 +37,17 @@ impl Clone for CloneCountState {
     }
 }
 
+/// A state held inline and large enough that moving one is measurable, so that the cache
+/// bookkeeping shows up against the action applications rather than hiding behind them.
+#[derive(Clone)]
+struct LargeState(#[expect(dead_code, reason = "only its size matters")] [u64; 512]);
+
+impl Default for LargeState {
+    fn default() -> Self {
+        Self([0; 512])
+    }
+}
+
 trait BenchmarkConfig {
     type Action: Default + Clone + Action<State: Default, Context = (), Error = Infallible>;
     fn name() -> &'static str;
@@ -47,6 +58,14 @@ impl BenchmarkConfig for TimingConfig {
     type Action = Noop<u8>;
     fn name() -> &'static str {
         "timing"
+    }
+}
+
+struct LargeStateTimingConfig;
+impl BenchmarkConfig for LargeStateTimingConfig {
+    type Action = Noop<LargeState>;
+    fn name() -> &'static str {
+        "timing_large_state"
     }
 }
 
@@ -157,7 +176,11 @@ fn count_criterion_config() -> Criterion<impl Measurement> {
         .with_measurement(CountMeasurement)
 }
 
-criterion_group!(time_benches, criterion_benchmark<TimingConfig>);
+criterion_group!(
+    time_benches,
+    criterion_benchmark<TimingConfig>,
+    criterion_benchmark<LargeStateTimingConfig>,
+);
 
 criterion_group! {
     name = apply_count_benches;
@@ -252,11 +275,11 @@ mod count_measurement {
         }
     }
 
-    impl Into<f64> for MeasurementValue {
-        fn into(self) -> f64 {
+    impl From<MeasurementValue> for f64 {
+        fn from(value: MeasurementValue) -> Self {
             // Criterion panics if measurement variance is zero, so we introduce some synthetic
             // noise.
-            self.0 as f64 + (self.1.0 as f64) / (i32::MAX as f64)
+            value.0 as f64 + (value.1.0 as f64) / (i32::MAX as f64)
         }
     }
 
