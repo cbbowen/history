@@ -405,7 +405,7 @@ where
 macro_rules! push_example {
     ($setup:expr, $call:expr) => {
         concat!(
-"# Example
+            "# Example
 
 ```
 # use history::*;
@@ -416,8 +416,12 @@ macro_rules! push_example {
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
-", $setup, "assert_eq!(*history.last_state(), 0);
-let version = ", $call, ";
+",
+            $setup,
+            "assert_eq!(*history.last_state(), 0);
+let version = ",
+            $call,
+            ";
 assert_eq!(*history.last_state(), 42);
 assert_eq!(history.last_version(), version);
 ```"
@@ -430,7 +434,7 @@ assert_eq!(history.last_version(), version);
 macro_rules! pop_example {
     ($setup:expr, $call:expr, $popped:expr) => {
         concat!(
-"# Example
+            "# Example
 
 ```
 # use history::*;
@@ -441,9 +445,15 @@ macro_rules! pop_example {
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
-", $setup, "history.push_action(Add(42));
+",
+            $setup,
+            "history.push_action(Add(42));
 assert_eq!(*history.last_state(), 42);
-assert_eq!(", $call, ", Some(", $popped, "));
+assert_eq!(",
+            $call,
+            ", Some(",
+            $popped,
+            "));
 assert_eq!(*history.last_state(), 0);
 ```"
         )
@@ -455,7 +465,7 @@ assert_eq!(*history.last_state(), 0);
 macro_rules! pop_actions_example {
     ($setup:expr, $call:expr) => {
         concat!(
-"# Example
+            "# Example
 
 ```
 # use history::*;
@@ -466,12 +476,16 @@ macro_rules! pop_actions_example {
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
-", $setup, "history.push_action(Add(1));
+",
+            $setup,
+            "history.push_action(Add(1));
 history.push_action(Add(2));
 history.push_action(Add(3));
 assert_eq!(*history.last_state(), 6);
 // The actions come back most recent first.
-assert_eq!(", $call, ", vec![Add(3), Add(2)]);
+assert_eq!(",
+            $call,
+            ", vec![Add(3), Add(2)]);
 assert_eq!(*history.last_state(), 1);
 ```"
         )
@@ -483,7 +497,7 @@ assert_eq!(*history.last_state(), 1);
 macro_rules! remove_example {
     ($setup:expr, $call:expr, $first:expr, $second:expr) => {
         concat!(
-"# Example
+            "# Example
 
 ```
 # use history::*;
@@ -506,15 +520,25 @@ macro_rules! remove_example {
 #  }
 # }
 # let mut history = History::new(vec![0, 0]);
-", $setup, "history.push_action(Set(0, 1));
+",
+            $setup,
+            "history.push_action(Set(0, 1));
 history.push_action(Set(1, 2));
 assert_eq!(*history.last_state(), vec![1, 2]);
 // `Set(0, 1)` commutes with `Set(1, 2)`, so this removal is cheap.
-assert_eq!(", $call, ", ", $first, ");
+assert_eq!(",
+            $call,
+            ", ",
+            $first,
+            ");
 assert_eq!(*history.last_state(), vec![0, 2]);
 // Removing an action that does not commute replays the actions after it.
 history.push_action(Set(1, 4));
-assert_eq!(", $call, ", ", $second, ");
+assert_eq!(",
+            $call,
+            ", ",
+            $second,
+            ");
 assert_eq!(*history.last_state(), vec![0, 4]);
 ```"
         )
@@ -523,7 +547,7 @@ assert_eq!(*history.last_state(), vec![0, 4]);
 
 macro_rules! push_complexity {
     () => {
-"# Time complexity
+        "# Time complexity
 
 Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping."
     };
@@ -531,7 +555,7 @@ Performs exactly one application and one state clone, plus *O*(log *n*) bookkeep
 
 macro_rules! pop_complexity {
     () => {
-"# Time complexity
+        "# Time complexity
 
 Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops replay
 nothing at all: the state they need is the one the push before them displaced."
@@ -540,7 +564,7 @@ nothing at all: the state they need is the one the push before them displaced."
 
 macro_rules! pop_actions_complexity {
     () => {
-"# Time complexity
+        "# Time complexity
 
 Takes *O*(*k* (1 + log (*n*/*k*))) amortized time."
     };
@@ -728,7 +752,6 @@ impl<A: Action> History<A> {
     ///
     /// Returns an error carrying the action back if applying it fails; in that case, the history
     /// is unchanged.
-    ///
     #[doc = push_example!(
         context_setup!(),
         "history.try_push_action_with(Add(42), &mut context).unwrap()"
@@ -758,7 +781,6 @@ impl<A: Action> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!(
         context_setup!(),
         "history.try_pop_action_and_state_with(&mut context).unwrap()",
@@ -783,7 +805,6 @@ impl<A: Action> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!(
         context_setup!(),
         "history.try_pop_action_with(&mut context).unwrap()",
@@ -803,7 +824,6 @@ impl<A: Action> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!(
         context_setup!(),
         "history.try_pop_state_with(&mut context).unwrap()",
@@ -823,7 +843,6 @@ impl<A: Action> History<A> {
     ///
     /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
     /// there have been fewer than `k` actions. On error, the history is unchanged.
-    ///
     #[doc = pop_actions_example!(
         context_setup!(),
         "history.try_pop_actions_with(2, &mut context).unwrap()"
@@ -956,7 +975,6 @@ impl<A: Action> History<A> {
     /// rebuilding the cached states; in that case, the action is not removed, but it may have
     /// been reordered past some of the actions it commutes with —
     /// [`RemoveActionError::ActionFailed`] carries its current index.
-    ///
     #[doc = remove_example!(
         context_setup!(),
         "history.try_remove_action_with(0, &mut context).unwrap()",
@@ -1082,10 +1100,8 @@ impl<A: Action> History<A> {
     }
 }
 
-
 impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// Adds a new action to the end of the history and returns the new version.
-    ///
     #[doc = push_example!(context_setup!(), "history.push_action_with(Add(42), &mut context)")]
     ///
     #[doc = push_complexity!()]
@@ -1100,7 +1116,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// Removes and returns the most recent action and the state it produced.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!(
         context_setup!(),
         "history.pop_action_and_state_with(&mut context)",
@@ -1116,7 +1131,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// Removes and returns the most recent action.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!(
         context_setup!(),
         "history.pop_action_with(&mut context)",
@@ -1132,7 +1146,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// Removes the most recent action and returns the state it produced.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!(context_setup!(), "history.pop_state_with(&mut context)", "42")]
     ///
     #[doc = pop_complexity!()]
@@ -1145,7 +1158,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
     /// there have been fewer than `k` actions.
-    ///
     #[doc = pop_actions_example!(context_setup!(), "history.pop_actions_with(2, &mut context)")]
     ///
     #[doc = pop_actions_complexity!()]
@@ -1159,7 +1171,6 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// rebuilt as if the removed action had never been applied.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range.
-    ///
     #[doc = remove_example!(
         context_setup!(),
         "history.remove_action_with(0, &mut context)",
@@ -1191,7 +1202,6 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// Returns an error carrying the action back if applying it fails; in that case, the history
     /// is unchanged.
-    ///
     #[doc = push_example!("", "history.try_push_action(Add(42)).unwrap()")]
     ///
     #[doc = push_complexity!()]
@@ -1203,7 +1213,6 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!("", "history.try_pop_action_and_state().unwrap()", "(Add(42), 42)")]
     ///
     #[doc = pop_complexity!()]
@@ -1215,7 +1224,6 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!("", "history.try_pop_action().unwrap()", "Add(42)")]
     ///
     #[doc = pop_complexity!()]
@@ -1227,7 +1235,6 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
     /// case, the history is unchanged.
-    ///
     #[doc = pop_example!("", "history.try_pop_state().unwrap()", "42")]
     ///
     #[doc = pop_complexity!()]
@@ -1239,7 +1246,6 @@ impl<A: Action<Context = ()>> History<A> {
     ///
     /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
     /// there have been fewer than `k` actions. On error, the history is unchanged.
-    ///
     #[doc = pop_actions_example!("", "history.try_pop_actions(2).unwrap()")]
     ///
     #[doc = pop_actions_complexity!()]
@@ -1255,7 +1261,6 @@ impl<A: Action<Context = ()>> History<A> {
     /// rebuilding the cached states; in that case, the action is not removed, but it may have
     /// been reordered past some of the actions it commutes with —
     /// [`RemoveActionError::ActionFailed`] carries its current index.
-    ///
     #[doc = remove_example!(
         "",
         "history.try_remove_action(0).unwrap()",
@@ -1280,7 +1285,6 @@ impl<A: Action<Context = ()>> History<A> {
 
 impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Adds a new action to the end of the history and returns the new version.
-    ///
     #[doc = push_example!("", "history.push_action(Add(42))")]
     ///
     #[doc = push_complexity!()]
@@ -1291,7 +1295,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Removes and returns the most recent action and the state it produced.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!("", "history.pop_action_and_state()", "(Add(42), 42)")]
     ///
     #[doc = pop_complexity!()]
@@ -1302,7 +1305,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Removes and returns the most recent action.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!("", "history.pop_action()", "Add(42)")]
     ///
     #[doc = pop_complexity!()]
@@ -1313,7 +1315,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Removes the most recent action and returns the state it produced.
     ///
     /// Returns `None` if there are no actions.
-    ///
     #[doc = pop_example!("", "history.pop_state()", "42")]
     ///
     #[doc = pop_complexity!()]
@@ -1325,7 +1326,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     ///
     /// Returns all actions that were removed, in reverse order, which may be fewer than `k` if
     /// there have been fewer than `k` actions.
-    ///
     #[doc = pop_actions_example!("", "history.pop_actions(2)")]
     ///
     #[doc = pop_actions_complexity!()]
@@ -1338,7 +1338,6 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// rebuilt as if the removed action had never been applied.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range.
-    ///
     #[doc = remove_example!(
         "",
         "history.remove_action(0)",
