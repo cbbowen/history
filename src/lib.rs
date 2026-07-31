@@ -37,6 +37,10 @@ pub trait Action: Sized {
     /// into `state` is always a correct implementation. However, history surgery can be made more
     /// efficient with an implementation that only restores the portion of the state this action
     /// actually affects.
+    ///
+    /// If [`Self::Centralizer`] *does* report that actions commute, this obligation is not
+    /// enough on its own: `state` is then a state some commuting actions further on, and
+    /// [`Centralizer`] documents the stronger property that must hold.
     fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
         state.clone_from(previous_state);
     }
@@ -48,13 +52,31 @@ pub struct Version(usize);
 
 /// Represents the set of actions an action commutes with.
 ///
-/// To be precise, if `Centralizer::for_action(a).commutes(b)`, then for all `s`,
-/// `a.inverse(b.apply(a.apply(s)))` *must* be equivalent to `b.apply(s)`.
+/// To be precise, let `c` be `Centralizer::for_action(a)` and let `b_1, ..., b_k` be any actions
+/// with `c.commutes(b_i)` for every `i`. Write `bs(s)` for applying them in order to a state `s`.
+/// Then for all `s`, inverting `a` back out of the state reached by applying it and then them,
+///
+/// ```text
+/// let mut state = bs(a.apply(s));
+/// a.inverse(&s, &mut state);
+/// ```
+///
+/// *must* leave `state` equivalent to `bs(s)`. Note that `a.inverse` is passed the state from
+/// before `a` was applied, not the one immediately preceding `state`; the two differ by exactly
+/// `b_1, ..., b_k`, which is what commuting has to make irrelevant. The single-action case
+/// `k = 1` is not sufficient: the `remove_action` family shifts an action past a whole run of
+/// commuting actions at once.
 ///
 /// False negative results will make the `remove_action` family of functions fall back to slower
 /// (but correct) implementations. False positive results will produce incorrect states.
 pub trait Centralizer<'a, A: Action> {
+    /// Returns the centralizer of `action`.
     fn for_action(action: &'a A) -> Self;
+
+    /// Returns whether the action this centralizer was built for commutes with `other`.
+    ///
+    /// Returning `false` is always sound; see the trait documentation for what returning `true`
+    /// promises.
     fn commutes(&self, other: &A) -> bool;
 }
 
