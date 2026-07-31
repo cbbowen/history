@@ -47,8 +47,25 @@ pub trait Action: Sized {
 }
 
 /// Identifies a specific version in the history.
+///
+/// Version `i` is the state reached by applying the first `i` actions, so it is also the index of
+/// the action that produced it plus one, and the index the `remove_action` family takes to remove
+/// that action.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(usize);
+
+impl Version {
+    /// Returns the number of actions applied to reach this version.
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl From<Version> for usize {
+    fn from(version: Version) -> Self {
+        version.0
+    }
+}
 
 /// Represents the set of actions an action commutes with.
 ///
@@ -92,42 +109,234 @@ impl<'a, A: Action> Centralizer<'a, A> for NonCommutative {
     }
 }
 
-/// The error type of [`History::try_push_action`].
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-#[error("failed to apply action")]
+// These error types are written out rather than derived because every derive would bound the
+// action type itself, which none of them stores except `PushError`. Deriving `Debug` on
+// `PopError<A>` would make `history.try_pop_action().unwrap()` require `A: Debug`.
+
+/// The error type of [`History::try_push_action`] and [`History::try_push_action_with`].
+///
+/// A failed push does not add the action to the history, so the error carries it back to the
+/// caller.
 pub struct PushError<A: Action> {
     action: A,
     error: A::Error,
 }
 
+impl<A: Action> PushError<A> {
+    /// Returns the action that could not be applied.
+    pub fn action(&self) -> &A {
+        &self.action
+    }
+
+    /// Returns the error that applying the action produced.
+    pub fn error(&self) -> &A::Error {
+        &self.error
+    }
+
+    /// Returns the action that could not be applied, consuming the error.
+    pub fn into_action(self) -> A {
+        self.action
+    }
+
+    /// Returns the error that applying the action produced, consuming the rest.
+    pub fn into_error(self) -> A::Error {
+        self.error
+    }
+
+    /// Splits into the action that could not be applied and the error it produced.
+    pub fn into_parts(self) -> (A, A::Error) {
+        (self.action, self.error)
+    }
+}
+
+impl<A: Action> std::fmt::Display for PushError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to apply action")
+    }
+}
+
+impl<A: Action + std::fmt::Debug> std::fmt::Debug for PushError<A>
+where
+    A::Error: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushError")
+            .field("action", &self.action)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<A: Action + PartialEq> PartialEq for PushError<A>
+where
+    A::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.action == other.action && self.error == other.error
+    }
+}
+
+impl<A: Action + Eq> Eq for PushError<A> where A::Error: Eq {}
+
+impl<A: Action + std::fmt::Debug> std::error::Error for PushError<A> where A::Error: std::fmt::Debug
+{}
+
 /// The error type of [`History::try_get_state`] and [`History::try_get_state_with`].
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum GetStateError<A: Action> {
-    #[error("version out of range")]
+    /// The requested version is later than the most recent one.
     VersionOutOfRange(Version),
 
-    #[error("failed to apply action")]
+    /// Applying an action failed while reconstructing the state.
     ActionFailed(A::Error),
 }
 
+impl<A: Action> std::fmt::Display for GetStateError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionOutOfRange(_) => f.write_str("version out of range"),
+            Self::ActionFailed(_) => f.write_str("failed to apply action"),
+        }
+    }
+}
+
+impl<A: Action> std::fmt::Debug for GetStateError<A>
+where
+    A::Error: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionOutOfRange(version) => {
+                f.debug_tuple("VersionOutOfRange").field(version).finish()
+            }
+            Self::ActionFailed(error) => f.debug_tuple("ActionFailed").field(error).finish(),
+        }
+    }
+}
+
+impl<A: Action> PartialEq for GetStateError<A>
+where
+    A::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::VersionOutOfRange(a), Self::VersionOutOfRange(b)) => a == b,
+            (Self::ActionFailed(a), Self::ActionFailed(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl<A: Action> Eq for GetStateError<A> where A::Error: Eq {}
+
+impl<A: Action> std::error::Error for GetStateError<A> where A::Error: std::fmt::Debug {}
+
 /// The error type of [`History::try_remove_action`] and [`History::try_remove_action_with`].
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
 pub enum RemoveActionError<A: Action> {
-    #[error("action index out of range")]
+    /// No action has the requested index.
     IndexOutOfRange(usize),
 
     /// Applying an action failed while rebuilding the cached states. The action to remove is
     /// still in the history at `index`, which may differ from the requested index: the action
     /// may have been shifted past actions it commutes with.
-    #[error("failed to apply action")]
-    ActionFailed { index: usize, error: A::Error },
+    ActionFailed {
+        /// Where the action to remove now sits.
+        index: usize,
+        /// The error that applying an action produced.
+        error: A::Error,
+    },
 }
+
+impl<A: Action> std::fmt::Display for RemoveActionError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfRange(_) => f.write_str("action index out of range"),
+            Self::ActionFailed { .. } => f.write_str("failed to apply action"),
+        }
+    }
+}
+
+impl<A: Action> std::fmt::Debug for RemoveActionError<A>
+where
+    A::Error: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfRange(index) => f.debug_tuple("IndexOutOfRange").field(index).finish(),
+            Self::ActionFailed { index, error } => f
+                .debug_struct("ActionFailed")
+                .field("index", index)
+                .field("error", error)
+                .finish(),
+        }
+    }
+}
+
+impl<A: Action> PartialEq for RemoveActionError<A>
+where
+    A::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::IndexOutOfRange(a), Self::IndexOutOfRange(b)) => a == b,
+            (
+                Self::ActionFailed { index, error },
+                Self::ActionFailed {
+                    index: other_index,
+                    error: other_error,
+                },
+            ) => index == other_index && error == other_error,
+            _ => false,
+        }
+    }
+}
+
+impl<A: Action> Eq for RemoveActionError<A> where A::Error: Eq {}
+
+impl<A: Action> std::error::Error for RemoveActionError<A> where A::Error: std::fmt::Debug {}
 
 /// The error type of [`History::try_pop_action_and_state`], [`History::try_pop_action`],
 /// [`History::try_pop_state`], and [`History::try_pop_actions`].
-#[derive(thiserror::Error, Debug, PartialEq, Eq)]
-#[error("failed to apply action")]
 pub struct PopError<A: Action>(A::Error);
+
+impl<A: Action> PopError<A> {
+    /// Returns the error that applying an action produced.
+    pub fn error(&self) -> &A::Error {
+        &self.0
+    }
+
+    /// Returns the error that applying an action produced, consuming this.
+    pub fn into_error(self) -> A::Error {
+        self.0
+    }
+}
+
+impl<A: Action> std::fmt::Display for PopError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to apply action")
+    }
+}
+
+impl<A: Action> std::fmt::Debug for PopError<A>
+where
+    A::Error: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PopError").field(&self.0).finish()
+    }
+}
+
+impl<A: Action> PartialEq for PopError<A>
+where
+    A::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<A: Action> Eq for PopError<A> where A::Error: Eq {}
+
+impl<A: Action> std::error::Error for PopError<A> where A::Error: std::fmt::Debug {}
 
 /// The history of state as actions are applied to it.
 #[derive(Debug, Clone)]
@@ -1741,6 +1950,41 @@ mod tests {
             history.assert_cache_invariant();
             assert_eq!(applications, CYCLES, "at n = {n}");
         }
+    }
+
+    /// Only `PushError` stores an action, so no other error type may bound the action type.
+    /// Compiling at all is most of this test.
+    #[test]
+    fn errors_do_not_bound_the_action_type() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct OpaqueError;
+
+        /// Deliberately neither `Debug` nor `PartialEq`.
+        struct Opaque(bool);
+
+        impl Action for Opaque {
+            type State = ();
+            type Error = OpaqueError;
+
+            fn apply(&self, _: (), _: &mut ()) -> Result<(), OpaqueError> {
+                if self.0 { Ok(()) } else { Err(OpaqueError) }
+            }
+        }
+
+        let mut history = History::<Opaque>::new(());
+        assert!(history.try_push_action(Opaque(true)).is_ok());
+
+        // `unwrap` on these needs only the *error* to be `Debug`, never the action.
+        assert_eq!(history.try_get_state(Version(1)).unwrap(), ());
+        assert_eq!(history.try_pop_action().unwrap().map(|a| a.0), Some(true));
+
+        // A failed push hands the action back rather than dropping it.
+        let error = history.try_push_action(Opaque(false)).err().unwrap();
+        assert_eq!(*error.error(), OpaqueError);
+        assert!(!error.into_action().0);
+        assert_eq!(history.last_version(), Version(0));
+        assert_eq!(history.last_version().index(), 0);
+        assert_eq!(usize::from(history.last_version()), 0);
     }
 
     #[test]
