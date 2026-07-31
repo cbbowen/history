@@ -421,20 +421,30 @@ impl<A: Action> History<A> {
     // applications and no state clones.
     fn prune_cache(&mut self) {
         let last = self.last_version();
+        let scale_at = |states: &[(Version, A::State)], index: usize| {
+            states
+                .get(index)
+                .and_then(|(version, _)| Self::window_of(last, *version))
+        };
+
         let mut previous = None;
+        let mut scale = scale_at(&self.states, 0);
         let mut write = 0;
         for read in 0..self.states.len() {
-            let scale = Self::window_of(last, self.states[read].0);
-            let next = self
-                .states
-                .get(read + 1)
-                .and_then(|(version, _)| Self::window_of(last, *version));
-            // Reading ahead is sound because nothing past `read` has been overwritten yet, and
-            // `previous` carries the scale the entry before `read` had before it moved.
+            // Carried from the previous iteration rather than recomputed, so each entry's window
+            // is measured once. Reading ahead is sound because nothing past `read` has been
+            // overwritten yet, and `previous` carries the scale the entry before `read` had
+            // before it moved.
+            let next = scale_at(&self.states, read + 1);
             let redundant = scale.is_some() && previous == scale && scale == next;
             previous = scale;
+            scale = next;
             if !redundant {
-                self.states.swap(write, read);
+                // Guarded because `swap` has no equal-index fast path: it copies the whole
+                // element through a temporary either way, and states can be large.
+                if write != read {
+                    self.states.swap(write, read);
+                }
                 write += 1;
             }
         }
@@ -455,16 +465,10 @@ impl<A: Action> History<A> {
     ) -> Result<Vec<(Version, A::State)>, A::Error> {
         let mut plan: Vec<(Version, A::State)> = Vec::new();
 
-        // The most recent state must always be cached: `last_state` hands it out directly.
-        if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
-            let (Version(base), state) = states.last().expect("the initial state is always cached");
-            let state = replay(*base, new_len, state.clone(), context)?;
-            plan.push((Version(new_len), state));
-        }
-
         // Fill the windows from the coarsest to the finest so that each refill can replay from a
         // state an earlier iteration already planned. The coarsest window always holds the
         // initial state, so the body never runs for it and the midpoint below cannot underflow.
+        // Successive targets ascend, which is what leaves `plan` sorted without a pass at the end.
         for scale in (0..Self::window_count(new_len)).rev() {
             let occupies =
                 |(Version(version), _): &(Version, A::State)| (new_len - *version) >> scale == 1;
@@ -482,7 +486,17 @@ impl<A: Action> History<A> {
             plan.push((Version(target), state));
         }
 
-        plan.sort_by_key(|(version, _)| *version);
+        // The most recent state must always be cached: `last_state` hands it out directly. It is
+        // planned last because it belongs to no window and sits at no version any refill above
+        // replays from, so the loop neither sees it nor needs it -- and appending it keeps the
+        // plan ascending.
+        if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
+            let (Version(base), state) = states.last().expect("the initial state is always cached");
+            let state = replay(*base, new_len, state.clone(), context)?;
+            plan.push((Version(new_len), state));
+        }
+
+        debug_assert!(plan.windows(2).all(|pair| pair[0].0 < pair[1].0));
         Ok(plan)
     }
 
@@ -492,7 +506,11 @@ impl<A: Action> History<A> {
     fn install_refill(&mut self, keep: usize, plan: Vec<(Version, A::State)>) {
         self.states.truncate(keep);
         self.states.extend(plan);
-        self.states.sort_by_key(|(version, _)| *version);
+        // Both halves are sorted, but a plan entry can fall before a kept one: a window is
+        // refilled at its midpoint, and the kept states nearer the end sit in finer windows.
+        // Unstable is fine and avoids a scratch buffer -- versions are unique, so the order is
+        // fully determined.
+        self.states.sort_unstable_by_key(|(version, _)| *version);
         self.prune_cache();
     }
 
