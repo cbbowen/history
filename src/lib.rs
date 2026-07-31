@@ -682,10 +682,12 @@ impl<A: Action> History<A> {
     ) -> Result<A::State, GetStateError<A>> {
         let state_index = self.get_recent_state_index(version)?;
         let (recent_version, state) = self.get_cached_state(state_index);
-        self.actions[recent_version.0..version.0]
-            .iter()
-            .try_fold(state.clone(), |s, a| a.apply(s, context))
-            .map_err(GetStateError::ActionFailed)
+        A::apply_batch(
+            &self.actions[recent_version.0..version.0],
+            state.clone(),
+            context,
+        )
+        .map_err(GetStateError::ActionFailed)
     }
 
     /// Returns the versions of the cached states.
