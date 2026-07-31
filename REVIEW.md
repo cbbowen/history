@@ -53,17 +53,17 @@ reported as commuting, inverting `a` out of `bₖ(…b₁(a(s)))` against `s` mu
 An implementor reading the single-action statement could write a conforming `inverse` that still
 breaks `remove_action`.
 
-### 4. `PushError` and `PopError` were unusable as errors — *fixed, except the cause chain*
+### 4. `PushError` and `PopError` were unusable as errors — *fixed*
 
 `PushError` held `action` and `error` as private fields with no accessors and no `into_action()`,
 so a failed push destroyed the caller's action. `PopError` was a private-field tuple struct.
 
-Not fixed: none of the error types marks its inner error as a `source`, so the cause chain is
-empty. Doing so needs `Action::Error: std::error::Error + 'static`, which is an API-breaking bound
-on the public trait (it would reject `type Error = ()`, as used in the tests). That is a design
-call for the crate owner, not a cleanup. Recommended if a `0.4` is on the table: the bound is
-cheap — `Infallible` already satisfies it — and it buys `#[source]` plus a `Display` that actually
-says what went wrong instead of the current constant string.
+The cause chain was empty too: no error type reported its inner error as a `source`. Fixing that
+needed `Action::Error: std::error::Error + 'static` on the public trait, which is breaking — it
+rejects `type Error = ()`, as the tests used. Done in `0.4.0` on the crate owner's call. Each
+wrapper's own `Display` still names only the operation that failed, per the API guidelines, so a
+chain-walking reporter prints each message exactly once. The bound also subsumed the
+`A::Error: Debug` clauses from finding 6, since `Error` implies `Debug`.
 
 ### 5. `Version`'s field was private with no accessor — *fixed*
 
@@ -139,3 +139,33 @@ a poor risk-to-benefit trade against code that is currently obviously correct.
 - `Action::Context`, `Action::Error`, `Action::Centralizer`, and both `Centralizer` methods had no
   doc comments. `#![warn(missing_docs)]` now catches these and future ones.
 - `try_pop_actions` / `pop_actions` were the only public operations without a doctest.
+
+## Measured effect of findings 7–10
+
+`cargo bench -- --baseline before 'timing'`, median change against the unmodified library. The
+large-state config was added for this: the bookkeeping moves whole states around, so its cost is
+invisible against the one-byte state the benchmarks used.
+
+| Benchmark | 1-byte state | 4 KiB inline state |
+| --- | --- | --- |
+| `push_action/10` | — | −39.8% |
+| `push_action/1000` | — | −71.3% |
+| `push_action/10000` | −17.0% | −82.5% |
+| `pop_action/10` | — | −70.2% |
+| `pop_action/10000` | — | −74.6% |
+| `pop_actions/all/1000` | −33.0% | −9.8% |
+| `pop_actions/all/10000` | −16.0% | −38.6% |
+| `pop_actions/n=10000/1` | −15.7% | −91.3% |
+| `pop_actions/n=10000/1000` | −14.8% | −58.5% |
+
+Nothing regressed. Dashes are runs where criterion did not print a comparison line.
+
+## A note on error-handling crates
+
+The hand-written impls replaced `thiserror`, and neither it nor `snafu` would improve on them:
+both generate `Display` / `Error` / `From` but require you to `#[derive(Debug)]` yourself, and
+that derive's spurious `A: Debug` bound was the entire problem (finding 6). Neither generates
+`PartialEq` / `Eq` either, which the tests compare errors with. `snafu` is additionally aimed at
+attaching per-call-site context to a shared underlying error through generated context selectors;
+these four types carry no context beyond a `usize` index and are built at six sites in total, so
+the selectors would have nothing to do. The crate now has no dependencies.
