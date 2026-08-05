@@ -611,18 +611,19 @@ impl<A: Action> History<A> {
     }
 
     /// Returns all the actions from oldest to newest.
-    pub fn actions(&self) -> impl Iterator<Item = &A> {
+    pub fn actions(&self) -> impl ExactSizeIterator<Item = &A> {
         self.actions.iter()
     }
 
     /// Returns all the actions from oldest to newest.
-    pub fn into_actions(self) -> impl Iterator<Item = A> {
+    pub fn into_actions(self) -> impl ExactSizeIterator<Item = A> {
         self.actions.into_iter()
     }
 
     /// Returns all the versions from oldest to newest.
-    pub fn versions(&self) -> impl Iterator<Item = Version> {
-        (0..=self.actions.len()).map(Version)
+    pub fn versions(&self) -> impl ExactSizeIterator<Item = Version> {
+        // Written this way to satisfy `ExactSizeIterator`.
+        (0..(self.actions.len() + 1)).map(Version)
     }
 
     // The cache holds states at geometrically spaced versions, dense near the most recent version
