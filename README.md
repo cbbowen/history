@@ -42,3 +42,35 @@ assert_eq!(*history.last_state(), 668);
 history.pop_action();
 assert_eq!(*history.last_state(), 710);
 ```
+
+## Bounding the history
+
+The history above is unbounded: it keeps every action forever, and only the *states* are held to *O*(log n). When that is too much, [`History::forget_actions`] folds the oldest actions into the initial state and drops them, which is the only way anything leaves the front.
+
+It costs nothing to do. The cached states are spaced geometrically backwards from the most recent version, so folding stops at the oldest cached state within reach and there is no state to reconstruct and no action to apply — just the actions to drop. In exchange it folds in only as many as it can reach that way, so it can fall short of what you asked for by a bounded factor; call it again as the history grows and it keeps up.
+
+```rust
+# enum MyAction { Add(i32), Sub(i32) }
+# impl history::Action for MyAction {
+# 	type State = i32;
+# 	fn apply(&self, state: i32, _: &mut Self::Context) -> Result<i32, Self::Error> {
+# 		Ok(match self { MyAction::Add(a) => state + a, MyAction::Sub(a) => state - a })
+# 	}
+# }
+let mut history = history::History::default();
+for i in 0..1000 {
+	history.push_action(MyAction::Add(i));
+}
+let version = history.last_version();
+
+// Keep roughly the most recent hundred actions.
+history.forget_actions(900);
+assert!(history.actions().len() < 400);
+
+// Whatever it dropped, the versions that remain are the versions they always were.
+assert_eq!(history.last_version(), version);
+assert_eq!(*history.last_state(), 499500);
+assert_eq!(history.get_state(history::Version::default()), None);
+```
+
+Versions are absolute, counting every action ever applied. A [`Version`] held across a fold therefore never comes to mean a different state: either it still names the state it always named, or the operation that takes it says it is gone.

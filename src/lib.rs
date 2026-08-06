@@ -72,6 +72,11 @@ pub trait Action: Sized {
 /// Version `i` is the state reached by applying the first `i` actions, so it is also the index of
 /// the action that produced it plus one, and the index the `remove_action` family takes to remove
 /// that action.
+///
+/// Versions are absolute: they count every action ever applied, including the ones
+/// `forget_actions` has folded into the initial state. A version that names a folded-away
+/// state stays meaningful — it is simply no longer reachable, and the operations that take one
+/// say so rather than answering about a different state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(usize);
 
@@ -207,6 +212,10 @@ pub enum GetStateError<A: Action> {
     /// The requested version is later than the most recent one.
     VersionOutOfRange(Version),
 
+    /// The requested version is older than the initial one, [`History::forget_actions`] having
+    /// folded it into the initial state.
+    VersionForgotten(Version),
+
     /// Applying an action failed while reconstructing the state.
     ActionFailed(A::Error),
 }
@@ -215,6 +224,7 @@ impl<A: Action> std::fmt::Display for GetStateError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::VersionOutOfRange(_) => f.write_str("version out of range"),
+            Self::VersionForgotten(_) => f.write_str("version already forgotten"),
             Self::ActionFailed(_) => f.write_str("failed to apply action"),
         }
     }
@@ -225,6 +235,9 @@ impl<A: Action> std::fmt::Debug for GetStateError<A> {
         match self {
             Self::VersionOutOfRange(version) => {
                 f.debug_tuple("VersionOutOfRange").field(version).finish()
+            }
+            Self::VersionForgotten(version) => {
+                f.debug_tuple("VersionForgotten").field(version).finish()
             }
             Self::ActionFailed(error) => f.debug_tuple("ActionFailed").field(error).finish(),
         }
@@ -238,6 +251,7 @@ where
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::VersionOutOfRange(a), Self::VersionOutOfRange(b)) => a == b,
+            (Self::VersionForgotten(a), Self::VersionForgotten(b)) => a == b,
             (Self::ActionFailed(a), Self::ActionFailed(b)) => a == b,
             _ => false,
         }
@@ -249,7 +263,7 @@ impl<A: Action> Eq for GetStateError<A> where A::Error: Eq {}
 impl<A: Action> std::error::Error for GetStateError<A> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::VersionOutOfRange(_) => None,
+            Self::VersionOutOfRange(_) | Self::VersionForgotten(_) => None,
             Self::ActionFailed(error) => Some(error),
         }
     }
@@ -259,6 +273,10 @@ impl<A: Action> std::error::Error for GetStateError<A> {
 pub enum RemoveActionError<A: Action> {
     /// No action has the requested index.
     IndexOutOfRange(usize),
+
+    /// The action at the requested index is no longer in the history,
+    /// [`History::forget_actions`] having folded it into the initial state.
+    IndexForgotten(usize),
 
     /// Applying an action failed while rebuilding the cached states. The action to remove is
     /// still in the history at `index`, which may differ from the requested index: the action
@@ -275,6 +293,7 @@ impl<A: Action> std::fmt::Display for RemoveActionError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IndexOutOfRange(_) => f.write_str("action index out of range"),
+            Self::IndexForgotten(_) => f.write_str("action index already forgotten"),
             Self::ActionFailed { .. } => f.write_str("failed to apply action"),
         }
     }
@@ -284,6 +303,7 @@ impl<A: Action> std::fmt::Debug for RemoveActionError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::IndexOutOfRange(index) => f.debug_tuple("IndexOutOfRange").field(index).finish(),
+            Self::IndexForgotten(index) => f.debug_tuple("IndexForgotten").field(index).finish(),
             Self::ActionFailed { index, error } => f
                 .debug_struct("ActionFailed")
                 .field("index", index)
@@ -300,6 +320,7 @@ where
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::IndexOutOfRange(a), Self::IndexOutOfRange(b)) => a == b,
+            (Self::IndexForgotten(a), Self::IndexForgotten(b)) => a == b,
             (
                 Self::ActionFailed { index, error },
                 Self::ActionFailed {
@@ -317,7 +338,7 @@ impl<A: Action> Eq for RemoveActionError<A> where A::Error: Eq {}
 impl<A: Action> std::error::Error for RemoveActionError<A> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::IndexOutOfRange(_) => None,
+            Self::IndexOutOfRange(_) | Self::IndexForgotten(_) => None,
             Self::ActionFailed { error, .. } => Some(error),
         }
     }
@@ -588,6 +609,8 @@ macro_rules! context_setup {
     };
 }
 
+const HAS_INITIAL_STATE: &str = "the initial state is always cached";
+
 impl<A: Action> History<A> {
     /// Constructs a new history with the given initial state.
     ///
@@ -610,26 +633,68 @@ impl<A: Action> History<A> {
         }
     }
 
-    /// Returns all the actions from oldest to newest.
+    /// Returns the initial state, which is the state at [`Self::initial_version`].
+    pub fn initial_state(&self) -> &A::State {
+        &self.states.first().expect(HAS_INITIAL_STATE).1
+    }
+
+    /// Returns the oldest version the history still holds.
+    ///
+    /// This is [`Version::default`] until [`Self::forget_actions`] folds actions into the initial
+    /// state, and the version of the state it folded them into thereafter. Every version before
+    /// it is gone: the operations that take one report that rather than answering about a
+    /// different state.
+    pub fn initial_version(&self) -> Version {
+        self.states.first().expect(HAS_INITIAL_STATE).0
+    }
+
+    // The number of actions the initial state already accounts for, and so the offset between a
+    // version and the index of the action at that version in `self.actions`. Derived from the
+    // cache rather than stored, so the two cannot disagree.
+    fn base(&self) -> usize {
+        self.initial_version().0
+    }
+
+    // The actions carrying the state at `from` to the state at `to`. Both must be versions this
+    // history still holds. Every replay goes through here so that no version is used to index
+    // `self.actions` directly.
+    fn action_range(&self, from: usize, to: usize) -> &[A] {
+        let base = self.base();
+        &self.actions[from - base..to - base]
+    }
+
+    /// Returns all the actions the history still holds, from oldest to newest.
+    ///
+    /// [`Self::forget_actions`] drops the actions it folds into the initial state, so this does
+    /// not necessarily start at [`Version::default`].
     pub fn actions(&self) -> impl ExactSizeIterator<Item = &A> {
         self.actions.iter()
     }
 
-    /// Returns all the actions from oldest to newest.
+    /// Returns all the actions the history still holds, from oldest to newest.
+    ///
+    /// [`Self::forget_actions`] drops the actions it folds into the initial state, so this does
+    /// not necessarily start at [`Version::default`].
     pub fn into_actions(self) -> impl ExactSizeIterator<Item = A> {
         self.actions.into_iter()
     }
 
-    /// Returns all the versions from oldest to newest.
+    /// Returns all the versions from oldest to newest, starting at [`Self::initial_version`].
     pub fn versions(&self) -> impl ExactSizeIterator<Item = Version> {
         // Written this way to satisfy `ExactSizeIterator`.
-        (0..(self.actions.len() + 1)).map(Version)
+        let base = self.base();
+        (base..(base + self.actions.len() + 1)).map(Version)
     }
 
     // The cache holds states at geometrically spaced versions, dense near the most recent version
     // and sparse near the oldest. Rather than pinning each state to an exact version, it groups
     // them into *windows*: window `scale` covers the versions whose distance from the most recent
     // one lies in `2^scale..2^(scale + 1)`. Every window holds one or two states.
+    //
+    // Windows are measured backwards from the most recent version and counted off the number of
+    // actions the history still holds, never off the version numbers themselves. That is what
+    // lets `forget_actions` drop a prefix without disturbing the layout: the windows it does not
+    // reach keep exactly the states they had.
     //
     // The redundancy is what keeps stepping back and forth cheap. A layout pinned to the length
     // of the history is a binary counter, so alternating a push with a pop re-propagates the same
@@ -638,7 +703,8 @@ impl<A: Action> History<A> {
     // and a rebuilt state is placed in the middle of its window, so it survives another
     // *O*(2^scale) operations in either direction before it must be rebuilt again.
 
-    // The number of windows a history of `len` actions has.
+    // The number of windows a history holding `len` actions has. This is the number the history
+    // still holds, not the number of versions it has been through.
     fn window_count(len: usize) -> u32 {
         if len == 0 { 0 } else { len.ilog2() + 1 }
     }
@@ -686,9 +752,9 @@ impl<A: Action> History<A> {
         self.states.truncate(write);
     }
 
-    // Returns the states that must be added to `states` for it to cache a history of `new_len`
-    // actions, ascending by version. `replay` must carry a state from one version of the *new*
-    // history to a later one.
+    // Returns the states that must be added to `states` for it to cache a history whose most
+    // recent version is `new_len`, ascending by version. `replay` must carry a state from one
+    // version of the *new* history to a later one.
     //
     // Every action application a cache repair needs happens here, so a caller can run this before
     // touching the history and leave it untouched if an application fails.
@@ -699,25 +765,28 @@ impl<A: Action> History<A> {
         context: &mut A::Context,
     ) -> Result<Vec<(Version, A::State)>, A::Error> {
         let mut plan: Vec<(Version, A::State)> = Vec::new();
+        // The oldest version the history holds, which the windows are counted off rather than off
+        // `new_len`: the actions before it have been folded into the state cached there.
+        let Version(initial) = states.first().expect(HAS_INITIAL_STATE).0;
 
         // Fill the windows from the coarsest to the finest so that each refill can replay from a
         // state an earlier iteration already planned. The coarsest window always holds the
         // initial state, so the body never runs for it and the midpoint below cannot underflow.
         // Successive targets ascend, which is what leaves `plan` sorted without a pass at the end.
-        for scale in (0..Self::window_count(new_len)).rev() {
+        for scale in (0..Self::window_count(new_len - initial)).rev() {
             let occupies =
                 |(Version(version), _): &(Version, A::State)| (new_len - *version) >> scale == 1;
             if states.iter().any(occupies) || plan.iter().any(occupies) {
                 continue;
             }
             let target = new_len - ((3 << scale) >> 1);
-            let (Version(base), state) = states
+            let (Version(from), state) = states
                 .iter()
                 .chain(plan.iter())
                 .filter(|(Version(version), _)| *version <= target)
                 .max_by_key(|(version, _)| *version)
-                .expect("the initial state is always cached");
-            let state = replay(*base, target, state.clone(), context)?;
+                .expect(HAS_INITIAL_STATE);
+            let state = replay(*from, target, state.clone(), context)?;
             plan.push((Version(target), state));
         }
 
@@ -726,8 +795,8 @@ impl<A: Action> History<A> {
         // replays from, so the loop neither sees it nor needs it -- and appending it keeps the
         // plan ascending.
         if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
-            let (Version(base), state) = states.last().expect("the initial state is always cached");
-            let state = replay(*base, new_len, state.clone(), context)?;
+            let (Version(from), state) = states.last().expect(HAS_INITIAL_STATE);
+            let state = replay(*from, new_len, state.clone(), context)?;
             plan.push((Version(new_len), state));
         }
 
@@ -769,7 +838,7 @@ impl<A: Action> History<A> {
             Err(error) => return Err(PushError { action, error }),
         };
         self.actions.push(action);
-        let new_version = Version(self.actions.len());
+        let new_version = self.last_version();
         self.states.push((new_version, new_state));
 
         // The state that was most recent lands in the finest window, so a push never leaves a
@@ -793,9 +862,10 @@ impl<A: Action> History<A> {
         &mut self,
         context: &mut A::Context,
     ) -> Result<Option<(A, A::State)>, PopError<A>> {
-        let Some(new_len) = self.actions.len().checked_sub(1) else {
+        if self.actions.is_empty() {
             return Ok(None);
-        };
+        }
+        let new_len = self.last_version().0 - 1;
         let Popped { mut actions, state } = self.pop_to(new_len, context)?;
         let action = actions.pop().expect("exactly one action was removed");
         let state = state.expect("the most recent state is always cached");
@@ -855,12 +925,15 @@ impl<A: Action> History<A> {
         k: usize,
         context: &mut A::Context,
     ) -> Result<Vec<A>, PopError<A>> {
-        let new_len = self.actions.len().saturating_sub(k);
+        // Saturates at the initial version rather than at zero: the actions before it are gone,
+        // and popping cannot bring them back.
+        let new_len = self.last_version().0 - k.min(self.actions.len());
         Ok(self.pop_to(new_len, context)?.actions)
     }
 
-    // Shortens the history to `new_len` actions, returning them in reverse order along with the
-    // state the most recent one produced, or `None` if nothing was removed.
+    // Shortens the history so that its most recent version is `new_len`, returning the actions
+    // removed in reverse order along with the state the most recent one produced, or `None` if
+    // nothing was removed. `new_len` must be a version the history holds.
     //
     // Every action application happens before any mutation, so on error the history is unchanged.
     fn pop_to(
@@ -868,6 +941,8 @@ impl<A: Action> History<A> {
         new_len: usize,
         context: &mut A::Context,
     ) -> Result<Popped<A>, PopError<A>> {
+        let base = self.base();
+        debug_assert!(base <= new_len && new_len <= self.last_version().0);
         // Keep every cached state the shorter history can still use and rebuild only the windows
         // that running the end backwards leaves empty. When several actions go at once, that
         // skips the states the same number of successive pops would compute and then discard.
@@ -877,7 +952,7 @@ impl<A: Action> History<A> {
         let plan = Self::plan_refill(
             &self.states[..keep],
             new_len,
-            |from, to, state, context| A::apply_batch(&self.actions[from..to], state, context),
+            |from, to, state, context| A::apply_batch(self.action_range(from, to), state, context),
             context,
         )
         .map_err(PopError)?;
@@ -891,9 +966,84 @@ impl<A: Action> History<A> {
         } else {
             None
         };
-        let actions = self.actions.drain(new_len..).rev().collect();
+        let actions = self.actions.drain(new_len - base..).rev().collect();
         self.install_refill(keep, plan);
         Ok(Popped { actions, state })
+    }
+
+    /// Folds up to the `k` oldest actions into the initial state, dropping them, and returns the
+    /// ones it folded in, oldest first.
+    ///
+    /// This is how a history that would otherwise grow without bound is kept to a size. The
+    /// versions before [`Self::initial_version`] are gone afterwards: [`Self::try_get_state`]
+    /// reports [`GetStateError::VersionForgotten`] for them, and the `remove_action` family
+    /// reports [`RemoveActionError::IndexForgotten`]. The versions that remain keep the numbers
+    /// they always had, so a [`Version`] held across a call still names the state it always
+    /// named, or else says it is gone — it never comes to mean a different state.
+    ///
+    /// Only as many actions are folded in as can be without replaying any: the fold stops at the
+    /// newest already-cached state at or before the `k`th action, so it may fold in fewer than
+    /// `k`, or none at all when no state is cached in between. The shortfall is bounded, because
+    /// the cache is geometrically spaced — asking to keep the most recent *m* actions leaves
+    /// fewer than four times that many — so repeating the call as the history grows keeps it to a
+    /// size. Ask for more than the history holds and it folds in everything, leaving the most
+    /// recent state as the initial one.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// history.push_action(Add(1));
+    /// history.push_action(Add(2));
+    /// history.push_action(Add(39));
+    /// let version = history.last_version();
+    ///
+    /// // The actions come back oldest first.
+    /// assert_eq!(history.forget_actions(2), vec![Add(1), Add(2)]);
+    /// assert_eq!(*history.initial_state(), 3);
+    ///
+    /// // Nothing observable about the versions that remain has changed.
+    /// assert_eq!(*history.last_state(), 42);
+    /// assert_eq!(history.last_version(), version);
+    /// assert_eq!(history.get_state(history.initial_version()), Some(3));
+    ///
+    /// // The versions that were folded in are gone rather than renumbered.
+    /// assert_eq!(history.get_state(Version::default()), None);
+    /// ```
+    ///
+    /// # Time complexity
+    ///
+    /// Performs no action applications and no state clones. Takes *O*(*m*) time, where *m* is the
+    /// number of actions left afterwards, to shift them down, plus *O*(log *n*) bookkeeping.
+    /// Folding away most of the history is therefore cheap and folding away a little is not, so
+    /// fold in bulk.
+    pub fn forget_actions(&mut self, k: usize) -> Vec<A> {
+        let base = self.base();
+        let target = base.saturating_add(k).min(self.last_version().0);
+        // The newest cached state at or before `target`. The initial state is always cached, so
+        // the partition is never empty, and its state is the one the folded actions produce.
+        let index = self.states.partition_point(|(Version(v), _)| *v <= target) - 1;
+        let Version(new_base) = self.states[index].0;
+
+        self.states.drain(..index);
+        let actions = self.actions.drain(..new_base - base).collect();
+
+        // Windows are measured from the most recent version, which a fold does not move, so every
+        // window the fold does not reach keeps exactly the states it had. The window at scale `t`
+        // covers versions after `last - 2^(t + 1)`, and for every window but the coarsest of the
+        // shortened history `2^(t + 1)` is at most the number of actions left, so none of them
+        // can lose a state, let alone run empty. The new coarsest window is the only one that
+        // changes: the new initial state lands in it, joining the one or two already there, and
+        // pruning is the whole repair.
+        self.prune_cache();
+        actions
     }
 
     /// Shifts the action at `index` past every consecutive later action it commutes with and
@@ -905,12 +1055,16 @@ impl<A: Action> History<A> {
         index: usize,
         context: &mut A::Context,
     ) -> Result<usize, RemoveActionError<A>> {
+        // Actions are addressed by version throughout, so every index into `self.actions` is
+        // offset by the actions the initial state has already absorbed.
+        let base = self.base();
+
         // Determine how late the action can go: just past the last consecutive action it
         // commutes with. The centralizer borrows the action, so it must be dropped before the
         // reordering below.
         let commuting = {
-            let centralizer = A::Centralizer::for_action(&self.actions[index]);
-            self.actions[index + 1..]
+            let centralizer = A::Centralizer::for_action(&self.actions[index - base]);
+            self.actions[index + 1 - base..]
                 .iter()
                 .take_while(|other| centralizer.commutes(other))
                 .count()
@@ -926,6 +1080,9 @@ impl<A: Action> History<A> {
             // Unreachable: `index` is in range, so `Version(index)` is too.
             Err(GetStateError::VersionOutOfRange(_)) => {
                 return Err(RemoveActionError::IndexOutOfRange(index));
+            }
+            Err(GetStateError::VersionForgotten(_)) => {
+                return Err(RemoveActionError::IndexForgotten(index));
             }
             Err(GetStateError::ActionFailed(error)) => {
                 return Err(RemoveActionError::ActionFailed { index, error });
@@ -948,8 +1105,8 @@ impl<A: Action> History<A> {
                 break;
             }
             let mut shifted = state.clone();
-            self.actions[position].inverse(&state_at_index, &mut shifted);
-            let shifted = match self.actions[cached_version].apply(shifted, context) {
+            self.actions[position - base].inverse(&state_at_index, &mut shifted);
+            let shifted = match self.actions[cached_version - base].apply(shifted, context) {
                 Ok(state) => state,
                 Err(error) => {
                     return Err(RemoveActionError::ActionFailed {
@@ -958,13 +1115,13 @@ impl<A: Action> History<A> {
                     });
                 }
             };
-            self.actions[position..=cached_version].rotate_left(1);
+            self.actions[position - base..=cached_version - base].rotate_left(1);
             self.states[cache_index].1 = shifted;
             position = cached_version;
         }
 
         // Finish the shift past any remaining commuting actions before the next cached state.
-        self.actions[position..=target].rotate_left(1);
+        self.actions[position - base..=target - base].rotate_left(1);
         Ok(target)
     }
 
@@ -972,10 +1129,10 @@ impl<A: Action> History<A> {
     /// the state at version `index` into the state at the following version). Later states are
     /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns an error if the index is out of range or applying an action fails while
-    /// rebuilding the cached states; in that case, the action is not removed, but it may have
-    /// been reordered past some of the actions it commutes with —
-    /// [`RemoveActionError::ActionFailed`] carries its current index.
+    /// Returns an error if the index is out of range, names an action a fold has already
+    /// swallowed, or applying an action fails while rebuilding the cached states; in that case,
+    /// the action is not removed, but it may have been reordered past some of the actions it
+    /// commutes with — [`RemoveActionError::ActionFailed`] carries its current index.
     #[doc = remove_example!(
         context_setup!(),
         "history.try_remove_action_with(0, &mut context).unwrap()",
@@ -992,6 +1149,9 @@ impl<A: Action> History<A> {
         let Version(last_version) = self.last_version();
         if index >= last_version {
             return Err(RemoveActionError::IndexOutOfRange(index));
+        }
+        if index < self.base() {
+            return Err(RemoveActionError::IndexForgotten(index));
         }
 
         // Shift the action as late as it can go cheaply; only the actions after its new position
@@ -1013,10 +1173,10 @@ impl<A: Action> History<A> {
                 // while before `index` and by the one at `v + 1` from `index` on, so a replay
                 // spans at most two runs of the actions as they stand now.
                 let split = index.clamp(from, to);
-                let state = A::apply_batch(&self.actions[from..split], state, context)?;
+                let state = A::apply_batch(self.action_range(from, split), state, context)?;
                 let tail = from.max(index);
                 if tail < to {
-                    A::apply_batch(&self.actions[tail + 1..to + 1], state, context)
+                    A::apply_batch(self.action_range(tail + 1, to + 1), state, context)
                 } else {
                     Ok(state)
                 }
@@ -1026,14 +1186,14 @@ impl<A: Action> History<A> {
         .map_err(|error| RemoveActionError::ActionFailed { index, error })?;
 
         // All mutation happens below and is infallible.
-        let action = self.actions.remove(index);
+        let action = self.actions.remove(index - self.base());
         self.install_refill(keep, plan);
         Ok(action)
     }
 
     /// Returns the most recent version.
     pub fn last_version(&self) -> Version {
-        Version(self.actions.len())
+        Version(self.base() + self.actions.len())
     }
 
     /// Returns the most recent state.
@@ -1042,10 +1202,7 @@ impl<A: Action> History<A> {
     ///
     /// Takes *O*(1) time.
     pub fn last_state(&self) -> &A::State {
-        let (version, state) = self
-            .states
-            .last()
-            .expect("the initial state is always cached");
+        let (version, state) = self.states.last().expect(HAS_INITIAL_STATE);
         debug_assert_eq!(*version, self.last_version());
         state
     }
@@ -1063,11 +1220,20 @@ impl<A: Action> History<A> {
         if version > self.last_version() {
             return Err(GetStateError::VersionOutOfRange(version));
         }
+        // Guarding this is not merely a courtesy: the partition below would be empty, and the
+        // index one before it would underflow.
+        if version < self.initial_version() {
+            return Err(GetStateError::VersionForgotten(version));
+        }
         // The initial state is always cached, so the partition is never empty.
         let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
         let (Version(cached), state) = &self.states[index];
-        A::apply_batch(&self.actions[*cached..version.0], state.clone(), context)
-            .map_err(GetStateError::ActionFailed)
+        A::apply_batch(
+            self.action_range(*cached, version.0),
+            state.clone(),
+            context,
+        )
+        .map_err(GetStateError::ActionFailed)
     }
 
     /// Returns the versions of the cached states.
@@ -1076,17 +1242,20 @@ impl<A: Action> History<A> {
         self.states.iter().map(|&(version, _)| version).collect()
     }
 
-    /// Panics unless the cache is in the shape every operation must leave it in: strictly
-    /// ascending, holding the initial and most recent states, and one or two states per window.
-    /// The upper bound is what keeps the cache *O*(log *n*); the lower bound is what keeps
+    /// Panics unless the cache is in the shape every operation must leave it in: non-empty,
+    /// strictly ascending, holding the most recent state, and one or two states per window. The
+    /// upper bound is what keeps the cache *O*(log *n*); the lower bound is what keeps
     /// [`Self::try_get_state_with`] linear in the distance back to the requested version.
+    ///
+    /// That the *initial* state is cached needs no assertion: the oldest cached state is what
+    /// defines it.
     #[cfg(test)]
     pub(crate) fn assert_cache_invariant(&self) {
         let last = self.last_version();
-        assert_eq!(self.states.first().map(|(v, _)| *v), Some(Version(0)));
+        assert!(!self.states.is_empty());
         assert_eq!(self.states.last().map(|(v, _)| *v), Some(last));
         assert!(self.states.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        for scale in 0..Self::window_count(last.0) {
+        for scale in 0..Self::window_count(last.0 - self.base()) {
             let occupancy = self
                 .states
                 .iter()
@@ -1171,7 +1340,8 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     /// the state at version `index` into the state at the following version). Later states are
     /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range.
+    /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
+    /// action [`Self::forget_actions`] has already folded into the initial state.
     #[doc = remove_example!(
         context_setup!(),
         "history.remove_action_with(0, &mut context)",
@@ -1183,12 +1353,16 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     pub fn remove_action_with(&mut self, index: usize, context: &mut A::Context) -> Option<A> {
         match self.try_remove_action_with(index, context) {
             Ok(action) => Some(action),
-            Err(RemoveActionError::IndexOutOfRange(_)) => None,
+            Err(RemoveActionError::IndexOutOfRange(_) | RemoveActionError::IndexForgotten(_)) => {
+                None
+            }
             Err(RemoveActionError::ActionFailed { error, .. }) => match error {},
         }
     }
 
-    /// Returns the state at the specified version, or `None` if there is no such version.
+    /// Returns the state at the specified version, or `None` if the history does not hold it —
+    /// either because it is yet to come or because [`Self::forget_actions`] has folded it into
+    /// the initial state.
     ///
     /// # Time complexity
     ///
@@ -1258,10 +1432,10 @@ impl<A: Action<Context = ()>> History<A> {
     /// the state at version `index` into the state at the following version). Later states are
     /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns an error if the index is out of range or applying an action fails while
-    /// rebuilding the cached states; in that case, the action is not removed, but it may have
-    /// been reordered past some of the actions it commutes with —
-    /// [`RemoveActionError::ActionFailed`] carries its current index.
+    /// Returns an error if the index is out of range, names an action a fold has already
+    /// swallowed, or applying an action fails while rebuilding the cached states; in that case,
+    /// the action is not removed, but it may have been reordered past some of the actions it
+    /// commutes with — [`RemoveActionError::ActionFailed`] carries its current index.
     #[doc = remove_example!(
         "",
         "history.try_remove_action(0).unwrap()",
@@ -1338,7 +1512,8 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// the state at version `index` into the state at the following version). Later states are
     /// rebuilt as if the removed action had never been applied.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range.
+    /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
+    /// action [`Self::forget_actions`] has already folded into the initial state.
     #[doc = remove_example!(
         "",
         "history.remove_action(0)",
@@ -1351,7 +1526,9 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
         self.remove_action_with(index, &mut ())
     }
 
-    /// Returns the state at the specified version, or `None` if there is no such version.
+    /// Returns the state at the specified version, or `None` if the history does not hold it —
+    /// either because it is yet to come or because [`Self::forget_actions`] has folded it into
+    /// the initial state.
     ///
     /// # Time complexity
     ///
@@ -1436,8 +1613,15 @@ mod tests {
 
     #[derive(Arbitrary, Clone, Debug)]
     enum Step<A> {
+        #[proptest(weight = 8)]
         Push(A),
+        #[proptest(weight = 4)]
         Pop,
+        /// Weighted well below the others so that histories still reach interesting lengths, and
+        /// asking for few actions so that the fold usually stops at a cached state part of the
+        /// way along rather than swallowing everything.
+        #[proptest(weight = 1)]
+        Forget(#[proptest(strategy = "0usize..16")] usize),
     }
 
     prop_compose! {
@@ -1450,6 +1634,9 @@ mod tests {
                     }
                     Step::Pop => {
                         history.pop_action();
+                    }
+                    Step::Forget(k) => {
+                        history.forget_actions(k);
                     }
                 }
             }
@@ -1526,6 +1713,7 @@ mod tests {
                 match step {
                     Step::Push(action) => { history.push_action(action); }
                     Step::Pop => { history.pop_action(); }
+                    Step::Forget(k) => { history.forget_actions(k); }
                 }
                 history.assert_cache_invariant();
             }
@@ -1588,9 +1776,79 @@ mod tests {
             prop_assert_eq!(Some(history.last_version()), history.versions().last());
         }
 
+        /// Folding must not disturb anything about the history it keeps. Every version that
+        /// survives still names the state it always named, at the number it always had.
+        #[test]
+        fn forget_actions_preserves_the_versions_it_keeps(
+            history: History<TestAction>,
+            k in 0usize..48,
+        ) {
+            let before = history.clone();
+            let mut history = history;
+            let folded = history.forget_actions(k);
+
+            // Never more than asked for, and exactly the prefix that is gone.
+            prop_assert!(folded.len() <= k);
+            prop_assert_eq!(
+                folded.len(),
+                history.initial_version().index() - before.initial_version().index()
+            );
+            prop_assert_eq!(
+                Vec::from_iter(before.actions().take(folded.len()).cloned()),
+                folded.clone()
+            );
+            prop_assert_eq!(
+                Vec::from_iter(before.actions().skip(folded.len()).cloned()),
+                Vec::from_iter(history.actions().cloned())
+            );
+
+            // The far end has not moved, and neither has any state still reachable.
+            prop_assert_eq!(history.last_version(), before.last_version());
+            for version in history.versions() {
+                prop_assert_eq!(history.get_state(version), before.get_state(version));
+            }
+            prop_assert_eq!(
+                Some(history.initial_state().clone()),
+                before.get_state(history.initial_version())
+            );
+
+            // The versions that went are gone, not renumbered onto other states.
+            for version in before.versions().take(folded.len()) {
+                prop_assert_eq!(
+                    history.try_get_state(version),
+                    Err(GetStateError::VersionForgotten(version))
+                );
+                prop_assert_eq!(
+                    history.clone().try_remove_action(version.index()),
+                    Err(RemoveActionError::IndexForgotten(version.index()))
+                );
+            }
+            history.assert_cache_invariant();
+        }
+
+        /// The shortfall from folding only as far as a cached state is bounded by the cache's
+        /// geometric spacing, which is what makes repeating the call enough to keep a history to
+        /// a size.
+        #[test]
+        fn forget_actions_leaves_a_bounded_remainder(n in 0usize..600, keep in 1usize..600) {
+            let mut history = History::<TestAction>::default();
+            for i in 0..n {
+                history.push_action(TestAction((i % 256) as u8));
+            }
+            history.forget_actions(n.saturating_sub(keep));
+
+            let remaining = history.actions().len();
+            prop_assert!(remaining >= keep.min(n), "kept {remaining}, wanted {keep}");
+            prop_assert!(remaining <= n, "kept {remaining} of {n}");
+            prop_assert!(remaining < 4 * keep, "kept {remaining} to keep {keep}");
+            history.assert_cache_invariant();
+        }
+
         #[test]
         fn get_state(history: History<TestAction>) {
-            let mut state = Default::default();
+            // Not `Default::default()`: a fold leaves the actions it absorbed in the initial
+            // state.
+            let mut state = history.initial_state().clone();
             let mut version_iter = history.versions();
             let Some(initial_version) = version_iter.next() else {
                 prop_assert!(false);
@@ -1684,6 +1942,51 @@ mod tests {
             history.assert_cache_invariant();
         }
 
+        /// Removal addresses actions by version, so it must keep working once a fold has moved
+        /// the actions out from under those numbers.
+        #[test]
+        fn try_remove_action_after_forgetting(
+            actions in prop::collection::vec(any::<SetSlot>(), 1..32),
+            forget in any::<prop::sample::Index>(),
+            index in any::<prop::sample::Index>(),
+        ) {
+            let mut history = History::new([0; SLOT_COUNT]);
+            for action in &actions {
+                history.push_action(*action);
+            }
+            // Never the whole history: there has to be an action left to remove, and folding
+            // never takes more than it is asked for.
+            let folded = history.forget_actions(forget.index(actions.len()));
+            prop_assert!(history.actions().len() > 0);
+
+            let initial = *history.initial_state();
+            let base = history.initial_version().index();
+            let index = base + index.index(history.actions().len());
+
+            let mut expected_actions = Vec::from_iter(history.actions().cloned());
+            let expected_removed = expected_actions.remove(index - base);
+            prop_assert_eq!(
+                history.try_remove_action_with(index, &mut ()).unwrap(),
+                expected_removed
+            );
+            prop_assert_eq!(
+                Vec::from_iter(history.actions().cloned()),
+                expected_actions.clone()
+            );
+            prop_assert_eq!(folded.len() + expected_actions.len() + 1, actions.len());
+
+            // Indistinguishable from a history that started life at the folded state and never
+            // saw the removed action, apart from where its versions are counted from.
+            let mut expected = History::new(initial);
+            for action in &expected_actions {
+                expected.push_action(*action);
+            }
+            for (version, reference) in history.versions().zip(expected.versions()) {
+                prop_assert_eq!(history.get_state(version), expected.get_state(reference));
+            }
+            history.assert_cache_invariant();
+        }
+
         #[test]
         fn try_remove_action_out_of_range(mut history: History<TestAction>) {
             let Version(index) = history.last_version();
@@ -1703,6 +2006,9 @@ mod tests {
                     }
                     Step::Pop => {
                         let _ = history.try_pop_action();
+                    }
+                    Step::Forget(k) => {
+                        history.forget_actions(k);
                     }
                 }
             }
@@ -1786,6 +2092,44 @@ mod tests {
                     "at n = {n}, {version:?}",
                 );
             }
+        }
+    }
+
+    /// Folding stops at a cached state, so it applies nothing at all — that is the whole reason
+    /// it takes no context and cannot fail. It must also leave the cheap-alternation property
+    /// intact, since it does not move the end of the history the windows are measured from.
+    #[test]
+    fn forget_actions_replays_nothing() {
+        for n in [64usize, 256, 1024, 4096] {
+            let mut applications = 0;
+            let mut history = History::<CountedAction>::default();
+            for i in 0..n {
+                history.push_action_with(CountedAction((i % 256) as u8), &mut applications);
+            }
+
+            applications = 0;
+            let folded = history.forget_actions(n / 2);
+            assert_eq!(applications, 0, "at n = {n}");
+            assert!(!folded.is_empty(), "at n = {n}, nothing was folded in");
+            history.assert_cache_invariant();
+
+            // The state the fold landed on is the one the actions it swallowed produce.
+            let expected: Vec<_> = (0..folded.len())
+                .map(|i| CountedAction((i % 256) as u8))
+                .collect();
+            assert_eq!(*history.initial_state(), expected, "at n = {n}");
+            assert_eq!(
+                history.initial_version().index(),
+                folded.len(),
+                "at n = {n}"
+            );
+
+            applications = 0;
+            for _ in 0..64 {
+                history.push_action_with(CountedAction(0), &mut applications);
+                history.pop_action_with(&mut applications);
+            }
+            assert_eq!(applications, 64, "at n = {n}, after folding");
         }
     }
 
@@ -1916,6 +2260,21 @@ mod tests {
             .try_remove_action(0)
             .unwrap_err();
         assert_eq!(chain(&error), ["action index out of range"]);
+        assert!(error.source().is_none());
+
+        // Nor do the ones a fold produces, which say that the state was reachable once rather
+        // than that it never existed.
+        let mut history = History::<Option<TestAction>>::default();
+        history.try_push_action(Some(TestAction(1))).unwrap();
+        history.try_push_action(Some(TestAction(2))).unwrap();
+        assert_eq!(history.forget_actions(2).len(), 2);
+
+        let error = history.try_get_state(Version(1)).unwrap_err();
+        assert_eq!(chain(&error), ["version already forgotten"]);
+        assert!(error.source().is_none());
+
+        let error = history.try_remove_action(1).unwrap_err();
+        assert_eq!(chain(&error), ["action index already forgotten"]);
         assert!(error.source().is_none());
     }
 

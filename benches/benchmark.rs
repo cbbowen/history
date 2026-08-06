@@ -168,6 +168,27 @@ fn criterion_benchmark<Config: BenchmarkConfig>(c: &mut Criterion<impl Measureme
             });
         }
     }
+    {
+        // Folding all but the most recent `keep` of a fixed number of actions. This applies
+        // nothing and clones no state whatever `keep` is -- the counting configurations are the
+        // point of the group -- so the timing left is the cost of shifting the actions that
+        // remain, which grows as `keep` does rather than as the fold does.
+        let count = *counts.last().unwrap();
+        let mut group = c.benchmark_group(format!("{}/forget_actions/n={count}", Config::name()));
+        let h = filled_history::<Config>(count);
+        for keep in [1, 10, 100, 1000] {
+            group.throughput(criterion::Throughput::Elements(count - keep));
+            group.bench_with_input(BenchmarkId::from_parameter(keep), &keep, |b, &keep| {
+                b.iter_batched_ref(
+                    || h.clone(),
+                    |h| {
+                        black_box(h.forget_actions((count - keep) as usize));
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
 }
 
 fn count_criterion_config() -> Criterion<impl Measurement> {
