@@ -26,6 +26,9 @@ enum MyAction {
 
 impl history::Action for MyAction {
 	type State = i32;
+	type Context = ();
+	type Error = std::convert::Infallible;
+	type Centralizer<'a> = history::NonCommutative;
 	fn apply(&self, state: i32, _: &mut Self::Context) -> Result<i32, Self::Error> {
 		Ok(match self {
 			MyAction::Add(a) => state + a,
@@ -53,6 +56,9 @@ It costs nothing to do. The cached states are spaced geometrically backwards fro
 # enum MyAction { Add(i32), Sub(i32) }
 # impl history::Action for MyAction {
 # 	type State = i32;
+#   type Context = ();
+# 	type Error = std::convert::Infallible;
+# 	type Centralizer<'a> = history::NonCommutative;
 # 	fn apply(&self, state: i32, _: &mut Self::Context) -> Result<i32, Self::Error> {
 # 		Ok(match self { MyAction::Add(a) => state + a, MyAction::Sub(a) => state - a })
 # 	}

@@ -1,35 +1,62 @@
-#![feature(associated_type_defaults)]
+#![cfg_attr(
+    feature = "associated_type_defaults",
+    feature(associated_type_defaults)
+)]
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
+
+macro_rules! context_doc {
+    () => {
+"Anything applying an action needs that the history does not hold, such as a resource pool or an interner. Every operation that can apply an action takes one by `&mut`.
+
+Defaults to `()`, which unlocks the shorter methods that do not take one at all."
+    }
+}
+
+macro_rules! error_doc {
+    () => {
+"The reason applying this action can fail.
+
+Defaults to [`Infallible`](std::convert::Infallible), which unlocks the methods that return the result directly rather than a [`Result`].
+
+This crate's error types report a value of this type as their [`source`](std::error::Error::source), so their own [`Display`](std::fmt::Display) says only which operation failed and leaves the reason to the chain."
+    }
+}
+
+macro_rules! centralizer_doc {
+    () => {
+"Which other actions this one commutes with, which is what lets the `remove_action` family avoid replaying the actions after the one it removes.
+
+Defaults to [`NonCommutative`], which never reports that anything commutes: always sound, and never faster."
+    }
+}
 
 /// An action which can be added to a [`History`].
 pub trait Action: Sized {
     /// The type of state this action affects.
     type State: Clone;
 
-    /// Anything applying an action needs that the history does not hold, such as a resource
-    /// pool or an interner. Every operation that can apply an action takes one by `&mut`.
-    ///
-    /// Defaults to `()`, which unlocks the shorter methods that do not take one at all.
+    #[cfg(feature = "associated_type_defaults")]
+    #[doc = context_doc!()]
     type Context = ();
+    #[cfg(not(feature = "associated_type_defaults"))]
+    #[doc = context_doc!()]
+    type Context;
 
-    /// The reason applying this action can fail.
-    ///
-    /// Defaults to [`Infallible`](std::convert::Infallible), which unlocks the methods that
-    /// return the result directly rather than a [`Result`].
-    ///
-    /// This crate's error types report a value of this type as their
-    /// [`source`](std::error::Error::source), so their own [`Display`](std::fmt::Display) says
-    /// only which operation failed and leaves the reason to the chain.
+    #[cfg(feature = "associated_type_defaults")]
+    #[doc = error_doc!()]
     type Error: std::error::Error + 'static = std::convert::Infallible;
+    #[cfg(not(feature = "associated_type_defaults"))]
+    #[doc = error_doc!()]
+    type Error: std::error::Error + 'static;
 
-    /// Which other actions this one commutes with, which is what lets the `remove_action` family
-    /// avoid replaying the actions after the one it removes.
-    ///
-    /// Defaults to [`NonCommutative`], which never reports that anything commutes: always sound,
-    /// and never faster.
+    #[cfg(feature = "associated_type_defaults")]
+    #[doc = centralizer_doc!()]
     type Centralizer<'a>: Centralizer<'a, Self> = NonCommutative;
+    #[cfg(not(feature = "associated_type_defaults"))]
+    #[doc = centralizer_doc!()]
+    type Centralizer<'a>: Centralizer<'a, Self>;
 
     /// Applies this action to a state, producing a new state.
     fn apply(
@@ -434,6 +461,9 @@ macro_rules! push_example {
 # struct Add(i32);
 # impl Action for Add {
 #  type State = i32;
+#  type Context = ();
+#  type Error = std::convert::Infallible;
+#  type Centralizer<'a> = NonCommutative;
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
@@ -463,6 +493,9 @@ macro_rules! pop_example {
 # struct Add(i32);
 # impl Action for Add {
 #  type State = i32;
+#  type Context = ();
+#  type Error = std::convert::Infallible;
+#  type Centralizer<'a> = NonCommutative;
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
@@ -494,6 +527,9 @@ macro_rules! pop_actions_example {
 # struct Add(i32);
 # impl Action for Add {
 #  type State = i32;
+#  type Context = ();
+#  type Error = std::convert::Infallible;
+#  type Centralizer<'a> = NonCommutative;
 #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
 # }
 # let mut history = History::default();
@@ -532,6 +568,8 @@ macro_rules! remove_example {
 # impl Action for Set {
 #  type State = Vec<i32>;
 #  type Centralizer<'a> = OtherIndices;
+#  type Context = ();
+#  type Error = std::convert::Infallible;
 #  fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
 #   state[self.0] = self.1;
 #   Ok(state)
@@ -621,6 +659,9 @@ impl<A: Action> History<A> {
     /// # struct NoOp;
     /// # impl Action for NoOp {
     /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  type Centralizer<'a> = NonCommutative;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(state) }
     /// # }
     /// let history = History::<NoOp>::new(42);
@@ -997,6 +1038,9 @@ impl<A: Action> History<A> {
     /// # struct Add(i32);
     /// # impl Action for Add {
     /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  type Centralizer<'a> = NonCommutative;
     /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
     /// # }
     /// # let mut history = History::default();
@@ -1544,14 +1588,21 @@ mod tests {
     #![allow(non_local_definitions)]
 
     use super::*;
+
     use proptest::prelude::*;
     use proptest_derive::Arbitrary;
+    use std::convert::Infallible;
 
     #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
     struct TestAction(u8);
 
     impl Action for TestAction {
         type State = Vec<TestAction>;
+
+        // Defaults.
+        type Context = ();
+        type Error = Infallible;
+        type Centralizer<'a> = NonCommutative;
 
         fn apply(
             &self,
@@ -1571,6 +1622,10 @@ mod tests {
     impl Action for CountedAction {
         type State = Vec<CountedAction>;
         type Context = usize;
+
+        // Defaults.
+        type Error = Infallible;
+        type Centralizer<'a> = NonCommutative;
 
         fn apply(
             &self,
@@ -1598,6 +1653,10 @@ mod tests {
     impl Action for Option<TestAction> {
         type State = Vec<TestAction>;
         type Error = NoAction;
+
+        // Defaults.
+        type Context = ();
+        type Centralizer<'a> = NonCommutative;
 
         fn apply(
             &self,
@@ -1896,6 +1955,10 @@ mod tests {
         type State = [u8; SLOT_COUNT];
         type Centralizer<'a> = OtherSlots;
 
+        // Defaults.
+        type Context = ();
+        type Error = Infallible;
+
         fn apply(
             &self,
             mut state: Self::State,
@@ -2179,6 +2242,10 @@ mod tests {
         impl Action for Opaque {
             type State = ();
             type Error = OpaqueError;
+
+            // Defaults.
+            type Context = ();
+            type Centralizer<'a> = NonCommutative;
 
             fn apply(&self, _: (), _: &mut ()) -> Result<(), OpaqueError> {
                 if self.0 { Ok(()) } else { Err(OpaqueError) }

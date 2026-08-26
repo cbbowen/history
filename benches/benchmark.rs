@@ -12,6 +12,10 @@ struct Noop<State> {
 impl<State: Clone> Action for Noop<State> {
     type State = State;
 
+    type Context = ();
+    type Error = Infallible;
+    type Centralizer<'a> = NonCommutative;
+
     fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         Ok(state)
     }
@@ -21,6 +25,10 @@ impl<State: Clone> Action for Noop<State> {
 struct CountApplyAction;
 impl Action for CountApplyAction {
     type State = u8;
+
+    type Context = ();
+    type Error = Infallible;
+    type Centralizer<'a> = NonCommutative;
 
     fn apply(&self, state: Self::State, _: &mut Self::Context) -> Result<Self::State, Self::Error> {
         CountMeasurement::increment();
