@@ -66,7 +66,7 @@ This crate's error types report a value of this type as their [`source`](std::er
 macro_rules! centralizer_doc {
     () => {
         concat!(
-"Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to. That is what lets the `remove_action` family correct the cached states after the action it removes rather than replay the actions that led to them.
+"Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to. That is what lets the `remove_action_applied_at` family correct the cached states after the action it removes rather than replay the actions that led to them.
 
 ",
             default_doc!(
@@ -146,10 +146,11 @@ pub trait Action: Sized {
 
 /// Identifies a specific version in the history.
 ///
-/// Version `i` is the state reached by applying the first `i` actions. The action applied *to*
-/// it, which leads to version `i + 1`, is the action with index `i`: that is the number
-/// [`History::action`] and the `remove_action` family take. The action that *produced* version
-/// `i` is therefore the one with index `i - 1`.
+/// Version `i` is the state reached by applying the first `i` actions. An action is *applied at*
+/// the version it is applied to: the action applied at version `i` leads to version `i + 1`, and
+/// that is the version by which [`History::action_applied_at`] and the
+/// `remove_action_applied_at` family name it. The action that *produced* version `i` is therefore
+/// the one applied at the version before it.
 ///
 /// Versions count from the first action ever pushed, including the actions `forget_actions` has
 /// since folded into the initial state, so a fold never renumbers anything. A version that names
@@ -163,8 +164,7 @@ pub trait Action: Sized {
 pub struct Version(usize);
 
 impl Version {
-    /// Returns the number of actions applied to reach this version, which is also the index of
-    /// the action applied to it.
+    /// Returns the number of actions applied to reach this version.
     pub fn index(self) -> usize {
         self.0
     }
@@ -179,8 +179,8 @@ impl From<Version> for usize {
 /// Represents the set of actions an action commutes with, and takes that action back out of a
 /// state they have since been applied to.
 ///
-/// This is what lets the `remove_action` family correct the cached states that follow the action
-/// it removes rather than replay the actions that led to them. The two halves cannot be
+/// This is what lets the `remove_action_applied_at` family correct the cached states that follow
+/// the action it removes rather than replay the actions that led to them. The two halves cannot be
 /// implemented apart, which is why they share a trait: [`Self::commutes`] promises something
 /// about what [`Self::inverse`] does.
 ///
@@ -196,11 +196,11 @@ impl From<Version> for usize {
 /// *must* leave `state` equivalent to `bs(s)`. Note that `inverse` is passed the state from
 /// before `a` was applied, not the one immediately preceding `state`; the two differ by exactly
 /// `b_1, ..., b_k`, which is what commuting has to make irrelevant. The single-action case
-/// `k = 1` is not sufficient: the `remove_action` family takes an action out from behind a whole
-/// run of commuting actions at once.
+/// `k = 1` is not sufficient: the `remove_action_applied_at` family takes an action out from behind
+/// a whole run of commuting actions at once.
 ///
-/// False negative results from `commutes` cost only time: the `remove_action` family replays the
-/// actions it could have skipped. False positive results will produce incorrect states.
+/// False negative results from `commutes` cost only time: the `remove_action_applied_at` family
+/// replays the actions it could have skipped. False positive results will produce incorrect states.
 ///
 /// # Example
 ///
@@ -248,7 +248,8 @@ impl From<Version> for usize {
 /// assert_eq!(*history.last_state(), vec![1, 2]);
 ///
 /// // Taken out from behind `Set(1, 2)`, which is not applied again.
-/// assert_eq!(history.remove_action(0), Some(Set(0, 1)));
+/// let first = history.initial_version();
+/// assert_eq!(history.remove_action_applied_at(first), Some(Set(0, 1)));
 /// assert_eq!(*history.last_state(), vec![0, 2]);
 /// ```
 pub trait Centralizer<'a, A: Action> {
@@ -496,14 +497,16 @@ impl<A: Action> std::error::Error for GetStateError<A> {
     }
 }
 
-/// The error type of [`History::try_remove_action`] and [`History::try_remove_action_with`].
+/// The error type of [`History::try_remove_action_applied_at`] and
+/// [`History::try_remove_action_applied_at_with`].
 pub enum RemoveActionError<A: Action> {
-    /// No action has the requested index.
-    IndexOutOfRange(usize),
+    /// No action is applied at the requested version yet: it is the most recent version, or
+    /// later than that.
+    VersionOutOfRange(Version),
 
-    /// The action at the requested index is no longer in the history,
+    /// The action applied at the requested version is no longer in the history,
     /// [`History::forget_actions`] having folded it into the initial state.
-    IndexForgotten(usize),
+    VersionForgotten(Version),
 
     /// Applying an action failed while rebuilding the cached states. The action to remove is
     /// still in the history, which is exactly as it was.
@@ -513,8 +516,8 @@ pub enum RemoveActionError<A: Action> {
 impl<A: Action> std::fmt::Display for RemoveActionError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IndexOutOfRange(_) => f.write_str("action index out of range"),
-            Self::IndexForgotten(_) => f.write_str("action index already forgotten"),
+            Self::VersionOutOfRange(_) => f.write_str("no action applied at version"),
+            Self::VersionForgotten(_) => f.write_str("version already forgotten"),
             Self::ActionFailed(_) => f.write_str("failed to apply action"),
         }
     }
@@ -523,8 +526,12 @@ impl<A: Action> std::fmt::Display for RemoveActionError<A> {
 impl<A: Action> std::fmt::Debug for RemoveActionError<A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IndexOutOfRange(index) => f.debug_tuple("IndexOutOfRange").field(index).finish(),
-            Self::IndexForgotten(index) => f.debug_tuple("IndexForgotten").field(index).finish(),
+            Self::VersionOutOfRange(version) => {
+                f.debug_tuple("VersionOutOfRange").field(version).finish()
+            }
+            Self::VersionForgotten(version) => {
+                f.debug_tuple("VersionForgotten").field(version).finish()
+            }
             Self::ActionFailed(error) => f.debug_tuple("ActionFailed").field(error).finish(),
         }
     }
@@ -536,8 +543,8 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::IndexOutOfRange(a), Self::IndexOutOfRange(b)) => a == b,
-            (Self::IndexForgotten(a), Self::IndexForgotten(b)) => a == b,
+            (Self::VersionOutOfRange(a), Self::VersionOutOfRange(b)) => a == b,
+            (Self::VersionForgotten(a), Self::VersionForgotten(b)) => a == b,
             (Self::ActionFailed(a), Self::ActionFailed(b)) => a == b,
             _ => false,
         }
@@ -549,7 +556,7 @@ impl<A: Action> Eq for RemoveActionError<A> where A::Error: Eq {}
 impl<A: Action> std::error::Error for RemoveActionError<A> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::IndexOutOfRange(_) | Self::IndexForgotten(_) => None,
+            Self::VersionOutOfRange(_) | Self::VersionForgotten(_) => None,
             Self::ActionFailed(error) => Some(error),
         }
     }
@@ -772,8 +779,8 @@ assert_eq!(*history.last_state(), 1);
     };
 }
 
-// The `# Example` section for the `remove_action` family. `call` removes the action at index 0
-// and must evaluate to `first` the first time and `second` the second.
+// The `# Example` section for the `remove_action_applied_at` family. `call` removes the oldest
+// action and must evaluate to `first` the first time and `second` the second.
 macro_rules! remove_example {
     ($setup:expr, $call:expr, $first:expr, $second:expr) => {
         concat!(
@@ -865,8 +872,8 @@ macro_rules! remove_complexity {
     () => {
         "# Time complexity
 
-Takes *O*(*m* + log *n*) amortized time, where *m* is the number of actions after `index`, and
-*O*(*n*) time in the worst case."
+Takes *O*(*m* + log *n*) amortized time, where *m* is the number of actions after the one
+removed, and *O*(*n*) time in the worst case."
     };
 }
 
@@ -950,16 +957,13 @@ impl<A: Action> History<A> {
         A::apply_batch(self.action_range(from, to), state, context)
     }
 
-    /// Returns the action at `index`, which is the action that transforms the state at version
-    /// `index` into the state at the following version. Returns `None` if the history does not
-    /// hold it, either because there is no such action yet or because [`Self::forget_actions`]
-    /// has folded it into the initial state.
+    /// Returns the action applied at `version`, which is the action that transforms the state at
+    /// `version` into the state at the following version. Returns `None` if no action is applied
+    /// there yet, as is the case for the most recent version, or if [`Self::forget_actions`] has
+    /// folded the action into the initial state.
     ///
-    /// These are the indices the `remove_action` family takes. They count from the first action
-    /// ever pushed, not from the oldest one the history still holds, so they are positions in
-    /// [`Self::actions`] only until a fold: after one, the action at position `p` there has
-    /// index `initial_version().index() + p`. Pairing [`Self::versions`] with [`Self::actions`]
-    /// gives each action alongside the version whose index it has.
+    /// The `remove_action_applied_at` family names actions the same way, and
+    /// [`Self::versions_and_actions`] returns every action with the version it is applied at.
     ///
     /// # Example
     ///
@@ -978,31 +982,67 @@ impl<A: Action> History<A> {
     /// history.push_action(Add(1));
     /// history.push_action(Add(2));
     /// history.push_action(Add(3));
-    /// assert_eq!(history.action(0), Some(&Add(1)));
+    /// let first = history.initial_version();
+    /// assert_eq!(history.action_applied_at(first), Some(&Add(1)));
     ///
-    /// // A fold drops the oldest actions without renumbering the rest.
+    /// // Nothing has been applied at the most recent version yet.
+    /// assert_eq!(history.action_applied_at(history.last_version()), None);
+    ///
+    /// // A fold drops the oldest actions without renumbering the versions that remain.
     /// assert_eq!(history.forget_actions(1), vec![Add(1)]);
-    /// assert_eq!(history.action(0), None);
-    /// assert_eq!(history.action(1), Some(&Add(2)));
-    ///
-    /// // So to find the index of an action, look for it alongside the versions.
-    /// let index = history
-    ///     .versions()
-    ///     .zip(history.actions())
-    ///     .find(|(_, action)| **action == Add(3))
-    ///     .map(|(version, _)| version.index());
-    /// assert_eq!(index, Some(2));
-    /// assert_eq!(history.remove_action(2), Some(Add(3)));
+    /// assert_eq!(history.action_applied_at(first), None);
+    /// assert_eq!(history.action_applied_at(history.initial_version()), Some(&Add(2)));
     /// ```
-    pub fn action(&self, index: usize) -> Option<&A> {
-        self.actions.get(index.checked_sub(self.base())?)
+    pub fn action_applied_at(&self, version: Version) -> Option<&A> {
+        self.actions.get(version.0.checked_sub(self.base())?)
+    }
+
+    /// Returns all the actions the history still holds, from oldest to newest, each with the
+    /// version it is applied at.
+    ///
+    /// That is the version by which [`Self::action_applied_at`] and the
+    /// `remove_action_applied_at` family name the action. It is not the version that pushing the
+    /// action returned, which is the one the action produced: the version after it.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  type Centralizer<'a> = NonCommutative;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// history.push_action(Add(1));
+    /// history.push_action(Add(2));
+    /// history.push_action(Add(3));
+    ///
+    /// let (version, _) = history
+    ///     .versions_and_actions()
+    ///     .find(|(_, action)| **action == Add(2))
+    ///     .unwrap();
+    /// assert_eq!(history.get_state(version), Some(1));
+    /// assert_eq!(history.remove_action_applied_at(version), Some(Add(2)));
+    /// assert_eq!(*history.last_state(), 4);
+    /// ```
+    pub fn versions_and_actions(&self) -> impl ExactSizeIterator<Item = (Version, &A)> {
+        let base = self.base();
+        self.actions
+            .iter()
+            .enumerate()
+            .map(move |(position, action)| (Version(base + position), action))
     }
 
     /// Returns all the actions the history still holds, from oldest to newest.
     ///
     /// [`Self::forget_actions`] drops the actions it folds into the initial state, so this does
-    /// not necessarily start at [`Version::default`], and an action's position here is not
-    /// necessarily its index: see [`Self::action`].
+    /// not necessarily start at [`Version::default`]. [`Self::versions_and_actions`] returns each
+    /// action with the version it is applied at.
     pub fn actions(&self) -> impl ExactSizeIterator<Item = &A> {
         self.actions.iter()
     }
@@ -1415,9 +1455,9 @@ impl<A: Action> History<A> {
     ///
     /// This is how a history that would otherwise grow without bound is kept to a size. The
     /// versions before [`Self::initial_version`] are gone afterwards: [`Self::try_get_state`]
-    /// reports [`GetStateError::VersionForgotten`] for them, and the `remove_action` family
-    /// reports [`RemoveActionError::IndexForgotten`]. The versions that remain keep the numbers
-    /// they always had, so a [`Version`] held across a call still names the state it always
+    /// reports [`GetStateError::VersionForgotten`] for them, and the `remove_action_applied_at`
+    /// family reports [`RemoveActionError::VersionForgotten`]. The versions that remain keep the
+    /// numbers they always had, so a [`Version`] held across a call still names the state it always
     /// named, or else says it is gone — it never comes to mean a different state.
     ///
     /// Only as many actions are folded in as can be without replaying any: the fold stops at the
@@ -1491,36 +1531,38 @@ impl<A: Action> History<A> {
         actions
     }
 
-    /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version: the one [`Self::action`]
-    /// returns for the same index. Later states are rebuilt as if the removed action had never
-    /// been applied, and every later version moves down by one.
+    /// Removes and returns the action applied at `version`, which is the action that transforms
+    /// the state at `version` into the state at the following version: the one
+    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
+    /// action had never been applied, and every later version moves down by one.
     ///
-    /// Returns an error if the index is out of range, names an action a fold has already
-    /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
-    /// the history is unchanged.
+    /// Returns an error if no action is applied at `version`, whether because none has been yet
+    /// or because a fold has already swallowed it, or if applying an action fails while
+    /// rebuilding the cached states. In every case, the history is unchanged.
     #[doc = remove_example!(
         context_setup!(),
-        "history.try_remove_action_with(0, &mut context).unwrap()",
+        "history.try_remove_action_applied_at_with(history.initial_version(), &mut context).unwrap()",
         "Set(0, 1)",
         "Set(1, 2)"
     )]
     ///
     #[doc = remove_complexity!()]
-    pub fn try_remove_action_with(
+    pub fn try_remove_action_applied_at_with(
         &mut self,
-        index: usize,
+        version: Version,
         context: &mut A::Context,
     ) -> Result<A, RemoveActionError<A>> {
+        // The version the action is applied at, which is its position among every action ever
+        // pushed. Every index into `self.actions` is offset from it by the actions the initial
+        // state has already absorbed.
+        let Version(index) = version;
         let Version(last_version) = self.last_version();
         if index >= last_version {
-            return Err(RemoveActionError::IndexOutOfRange(index));
+            return Err(RemoveActionError::VersionOutOfRange(version));
         }
-        // Actions are addressed by version throughout, so every index into `self.actions` is
-        // offset by the actions the initial state has already absorbed.
         let base = self.base();
         if index < base {
-            return Err(RemoveActionError::IndexForgotten(index));
+            return Err(RemoveActionError::VersionForgotten(version));
         }
         let new_len = last_version - 1;
 
@@ -1837,27 +1879,32 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
             .unwrap_or_else(|error| match error.into_error() {})
     }
 
-    /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version: the one [`Self::action`]
-    /// returns for the same index. Later states are rebuilt as if the removed action had never
-    /// been applied, and every later version moves down by one.
+    /// Removes and returns the action applied at `version`, which is the action that transforms
+    /// the state at `version` into the state at the following version: the one
+    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
+    /// action had never been applied, and every later version moves down by one.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
-    /// action [`Self::forget_actions`] has already folded into the initial state.
+    /// Returns `None` and leaves the history unchanged if no action is applied at `version`,
+    /// whether because none has been yet or because [`Self::forget_actions`] has already folded
+    /// it into the initial state.
     #[doc = remove_example!(
         context_setup!(),
-        "history.remove_action_with(0, &mut context)",
+        "history.remove_action_applied_at_with(history.initial_version(), &mut context)",
         "Some(Set(0, 1))",
         "Some(Set(1, 2))"
     )]
     ///
     #[doc = remove_complexity!()]
-    pub fn remove_action_with(&mut self, index: usize, context: &mut A::Context) -> Option<A> {
-        match self.try_remove_action_with(index, context) {
+    pub fn remove_action_applied_at_with(
+        &mut self,
+        version: Version,
+        context: &mut A::Context,
+    ) -> Option<A> {
+        match self.try_remove_action_applied_at_with(version, context) {
             Ok(action) => Some(action),
-            Err(RemoveActionError::IndexOutOfRange(_) | RemoveActionError::IndexForgotten(_)) => {
-                None
-            }
+            Err(
+                RemoveActionError::VersionOutOfRange(_) | RemoveActionError::VersionForgotten(_),
+            ) => None,
             Err(RemoveActionError::ActionFailed(error)) => match error {},
         }
     }
@@ -1950,24 +1997,27 @@ impl<A: Action<Context = ()>> History<A> {
         self.try_pop_actions_with(k, &mut ())
     }
 
-    /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version: the one [`Self::action`]
-    /// returns for the same index. Later states are rebuilt as if the removed action had never
-    /// been applied, and every later version moves down by one.
+    /// Removes and returns the action applied at `version`, which is the action that transforms
+    /// the state at `version` into the state at the following version: the one
+    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
+    /// action had never been applied, and every later version moves down by one.
     ///
-    /// Returns an error if the index is out of range, names an action a fold has already
-    /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
-    /// the history is unchanged.
+    /// Returns an error if no action is applied at `version`, whether because none has been yet
+    /// or because a fold has already swallowed it, or if applying an action fails while
+    /// rebuilding the cached states. In every case, the history is unchanged.
     #[doc = remove_example!(
         "",
-        "history.try_remove_action(0).unwrap()",
+        "history.try_remove_action_applied_at(history.initial_version()).unwrap()",
         "Set(0, 1)",
         "Set(1, 2)"
     )]
     ///
     #[doc = remove_complexity!()]
-    pub fn try_remove_action(&mut self, index: usize) -> Result<A, RemoveActionError<A>> {
-        self.try_remove_action_with(index, &mut ())
+    pub fn try_remove_action_applied_at(
+        &mut self,
+        version: Version,
+    ) -> Result<A, RemoveActionError<A>> {
+        self.try_remove_action_applied_at_with(version, &mut ())
     }
 
     /// Returns the state at the specified version.
@@ -2043,23 +2093,24 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
         self.pop_actions_with(k, &mut ())
     }
 
-    /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version: the one [`Self::action`]
-    /// returns for the same index. Later states are rebuilt as if the removed action had never
-    /// been applied, and every later version moves down by one.
+    /// Removes and returns the action applied at `version`, which is the action that transforms
+    /// the state at `version` into the state at the following version: the one
+    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
+    /// action had never been applied, and every later version moves down by one.
     ///
-    /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
-    /// action [`Self::forget_actions`] has already folded into the initial state.
+    /// Returns `None` and leaves the history unchanged if no action is applied at `version`,
+    /// whether because none has been yet or because [`Self::forget_actions`] has already folded
+    /// it into the initial state.
     #[doc = remove_example!(
         "",
-        "history.remove_action(0)",
+        "history.remove_action_applied_at(history.initial_version())",
         "Some(Set(0, 1))",
         "Some(Set(1, 2))"
     )]
     ///
     #[doc = remove_complexity!()]
-    pub fn remove_action(&mut self, index: usize) -> Option<A> {
-        self.remove_action_with(index, &mut ())
+    pub fn remove_action_applied_at(&mut self, version: Version) -> Option<A> {
+        self.remove_action_applied_at_with(version, &mut ())
     }
 
     /// Returns the state at the specified version, or `None` if the history does not hold it —
@@ -2211,7 +2262,7 @@ mod tests {
                 Step::Remove(index) => {
                     if len > 0 {
                         let index = history.initial_version().index() + index.index(len);
-                        let _ = history.try_remove_action(index);
+                        let _ = history.try_remove_action_applied_at(Version(index));
                     }
                 }
                 Step::Forget(k) => {
@@ -2387,27 +2438,33 @@ mod tests {
             prop_assert_eq!(Some(history.last_version()), history.versions().last());
         }
 
-        /// An action's index is the version it is applied to, wherever the history now starts,
-        /// and it is the index that removes it.
+        /// An action is named by the version it is applied at, wherever the history now starts:
+        /// that is the version it is listed with, found by, and removed by.
         #[test]
-        fn action(history: History<TestAction>, beyond in 0usize..4) {
+        fn action_applied_at(history: History<TestAction>, beyond in 0usize..4) {
             let Version(base) = history.initial_version();
             let Version(last) = history.last_version();
-            prop_assert_eq!(history.versions().len(), history.actions().len() + 1);
-            for (position, (version, action)) in
-                history.versions().zip(history.actions()).enumerate()
-            {
-                prop_assert_eq!(version.index(), base + position);
-                prop_assert_eq!(history.action(version.index()), Some(action));
+
+            // Every action, in order, alongside every version but the last.
+            let listed = history.versions_and_actions();
+            prop_assert_eq!(listed.len(), history.actions().len());
+            prop_assert!(listed.eq(history.versions().zip(history.actions())));
+
+            for (position, (version, action)) in history.versions_and_actions().enumerate() {
+                prop_assert_eq!(version, Version(base + position));
+                prop_assert_eq!(history.action_applied_at(version), Some(action));
                 prop_assert_eq!(
-                    history.clone().remove_action(version.index()),
+                    history.clone().remove_action_applied_at(version),
                     Some(*action)
                 );
             }
-            prop_assert_eq!(history.action(last + beyond), None);
-            prop_assert_eq!(history.action(usize::MAX), None);
-            for index in base.saturating_sub(beyond + 1)..base {
-                prop_assert_eq!(history.action(index), None);
+
+            // Nothing is applied at the most recent version or beyond it, and whatever was
+            // applied before the initial one is gone.
+            prop_assert_eq!(history.action_applied_at(Version(last + beyond)), None);
+            prop_assert_eq!(history.action_applied_at(Version(usize::MAX)), None);
+            for version in (base.saturating_sub(beyond + 1)..base).map(Version) {
+                prop_assert_eq!(history.action_applied_at(version), None);
             }
         }
 
@@ -2454,8 +2511,8 @@ mod tests {
                     Err(GetStateError::VersionForgotten(version))
                 );
                 prop_assert_eq!(
-                    history.clone().try_remove_action(version.index()),
-                    Err(RemoveActionError::IndexForgotten(version.index()))
+                    history.clone().try_remove_action_applied_at(version),
+                    Err(RemoveActionError::VersionForgotten(version))
                 );
             }
             history.assert_cache_invariant();
@@ -2689,7 +2746,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn try_remove_action(
+        fn try_remove_action_applied_at(
             actions in prop::collection::vec(Mix::<true>::strategy(), 1..200),
             index in any::<prop::sample::Index>(),
         ) {
@@ -2702,7 +2759,7 @@ mod tests {
 
             let mut expected_actions = actions.clone();
             let expected_removed = expected_actions.remove(index);
-            prop_assert_eq!(history.try_remove_action_with(index, meter), Ok(expected_removed));
+            prop_assert_eq!(history.try_remove_action_applied_at_with(Version(index), meter), Ok(expected_removed));
             prop_assert_eq!(&history.actions, &expected_actions);
 
             // The history must be indistinguishable from one built from the remaining actions,
@@ -2724,7 +2781,7 @@ mod tests {
         /// Removal addresses actions by version, so it must keep working once a fold has moved
         /// the actions out from under those numbers.
         #[test]
-        fn try_remove_action_after_forgetting(
+        fn try_remove_action_applied_at_after_forgetting(
             actions in prop::collection::vec(Mix::<true>::strategy(), 1..200),
             forget in any::<prop::sample::Index>(),
             index in any::<prop::sample::Index>(),
@@ -2745,7 +2802,7 @@ mod tests {
 
             let mut expected_actions = history.actions.clone();
             let expected_removed = expected_actions.remove(index - base);
-            prop_assert_eq!(history.try_remove_action_with(index, meter), Ok(expected_removed));
+            prop_assert_eq!(history.try_remove_action_applied_at_with(Version(index), meter), Ok(expected_removed));
             prop_assert_eq!(&history.actions, &expected_actions);
             prop_assert_eq!(folded.len() + expected_actions.len() + 1, actions.len());
 
@@ -2766,17 +2823,17 @@ mod tests {
         }
 
         #[test]
-        fn try_remove_action_out_of_range(
+        fn try_remove_action_applied_at_out_of_range(
             mut history: History<TestAction>,
             beyond in 0usize..4,
         ) {
             let before = history.clone();
             for index in [history.last_version().index() + beyond, usize::MAX] {
                 prop_assert_eq!(
-                    history.try_remove_action(index),
-                    Err(RemoveActionError::IndexOutOfRange(index))
+                    history.try_remove_action_applied_at(Version(index)),
+                    Err(RemoveActionError::VersionOutOfRange(Version(index)))
                 );
-                prop_assert_eq!(history.remove_action(index), None);
+                prop_assert_eq!(history.remove_action_applied_at(Version(index)), None);
             }
             prop_assert_eq!(&history.actions, &before.actions);
             prop_assert_eq!(&history.states, &before.states);
@@ -2798,7 +2855,10 @@ mod tests {
 
                     INVERSIONS.set(0);
                     assert_eq!(
-                        history.try_remove_action_with(index, &mut Meter::unlimited()),
+                        history.try_remove_action_applied_at_with(
+                            Version(index),
+                            &mut Meter::unlimited()
+                        ),
                         Ok(removed)
                     );
                     assert_eq!(INVERSIONS.get(), 0);
@@ -2828,10 +2888,10 @@ mod tests {
                         let mut spent = Meter::unlimited();
 
                         let removed = commuting
-                            .try_remove_action_with(index, &mut saved)
+                            .try_remove_action_applied_at_with(Version(index), &mut saved)
                             .expect("the meter is unlimited");
                         let expected = plain
-                            .try_remove_action_with(index, &mut spent)
+                            .try_remove_action_applied_at_with(Version(index), &mut spent)
                             .expect("the meter is unlimited");
                         assert_eq!(
                             (removed.slot, removed.value),
@@ -2889,7 +2949,7 @@ mod tests {
                 let mut history = history.clone();
                 tally.fill(0);
                 assert_eq!(
-                    history.remove_action_with(index, &mut tally),
+                    history.remove_action_applied_at_with(Version(index), &mut tally),
                     Some(Tallied(index))
                 );
                 assert!(
@@ -2908,7 +2968,10 @@ mod tests {
         // then counts as cached: nothing more is replayed to fill the window it sits in.
         let mut history = tallied_history_via::<true>(14, 8, 9);
         let mut tally = vec![0; 9];
-        assert_eq!(history.remove_action_with(1, &mut tally), Some(Tallied(1)));
+        assert_eq!(
+            history.remove_action_applied_at_with(Version(1), &mut tally),
+            Some(Tallied(1))
+        );
         assert_eq!(tally, [1, 0, 0, 0, 0, 0, 0, 0, 0]);
 
         for n in (1usize..=64).chain([100, 257, 1000]) {
@@ -2921,7 +2984,7 @@ mod tests {
             CLONES.set(0);
             INVERSIONS.set(0);
             history
-                .try_remove_action_with(0, &mut meter)
+                .try_remove_action_applied_at_with(Version(0), &mut meter)
                 .expect("the meter is unlimited");
             assert_eq!(meter.applications, 0, "removing the first of {n}");
             assert!(INVERSIONS.get() <= cached, "removing the first of {n}");
@@ -2946,13 +3009,16 @@ mod tests {
                         let mut needed = Meter::unlimited();
                         let mut removed = history.clone();
                         removed
-                            .try_remove_action_with(index, &mut needed)
+                            .try_remove_action_applied_at_with(Version(index), &mut needed)
                             .expect("the meter is unlimited");
 
                         for budget in 0..needed.applications {
                             let mut failed = history.clone();
                             assert_eq!(
-                                failed.try_remove_action_with(index, &mut Meter::limited(budget)),
+                                failed.try_remove_action_applied_at_with(
+                                    Version(index),
+                                    &mut Meter::limited(budget)
+                                ),
                                 Err(RemoveActionError::ActionFailed(Exhausted))
                             );
                             assert_eq!(failed.actions, history.actions);
@@ -2961,7 +3027,11 @@ mod tests {
 
                         let mut exact = history.clone();
                         let mut meter = Meter::limited(needed.applications);
-                        assert!(exact.try_remove_action_with(index, &mut meter).is_ok());
+                        assert!(
+                            exact
+                                .try_remove_action_applied_at_with(Version(index), &mut meter)
+                                .is_ok()
+                        );
                         assert_eq!(exact.states, removed.states);
                     }
                 }
@@ -3131,7 +3201,7 @@ mod tests {
                 let mut history = pushed.clone();
                 tally.fill(0);
                 assert_eq!(
-                    history.remove_action_with(index, &mut tally),
+                    history.remove_action_applied_at_with(Version(index), &mut tally),
                     Some(Tallied(index))
                 );
                 assert_eq!(
@@ -3302,10 +3372,18 @@ mod tests {
                 history.push_actions_with([CountedAction(0); 15], &mut 0);
             },
             |history| {
-                assert!(history.remove_action_with(0, &mut 0).is_some());
+                assert!(
+                    history
+                        .remove_action_applied_at_with(Version(0), &mut 0)
+                        .is_some()
+                );
             },
             |history| {
-                assert!(history.remove_action_with(0, &mut 0).is_some());
+                assert!(
+                    history
+                        .remove_action_applied_at_with(Version(0), &mut 0)
+                        .is_some()
+                );
                 assert_eq!(history.pop_actions_with(4, &mut 0).len(), 4);
             },
             |history| {
@@ -3565,7 +3643,7 @@ mod tests {
 
         let error = pushed
             .clone()
-            .try_remove_action_with(0, &mut Meter::limited(0))
+            .try_remove_action_applied_at_with(Version(0), &mut Meter::limited(0))
             .unwrap_err();
         assert_eq!(error, RemoveActionError::ActionFailed(Exhausted));
         assert_eq!(chain(&error), spent);
@@ -3589,9 +3667,9 @@ mod tests {
         assert!(error.source().is_none());
 
         let error = History::<Option<TestAction>>::default()
-            .try_remove_action(0)
+            .try_remove_action_applied_at(Version(0))
             .unwrap_err();
-        assert_eq!(chain(&error), ["action index out of range"]);
+        assert_eq!(chain(&error), ["no action applied at version"]);
         assert!(error.source().is_none());
 
         // Nor do the ones a fold produces, which say that the state was reachable once rather
@@ -3605,8 +3683,10 @@ mod tests {
         assert_eq!(chain(&error), ["version already forgotten"]);
         assert!(error.source().is_none());
 
-        let error = history.try_remove_action(1).unwrap_err();
-        assert_eq!(chain(&error), ["action index already forgotten"]);
+        let error = history
+            .try_remove_action_applied_at(Version(1))
+            .unwrap_err();
+        assert_eq!(chain(&error), ["version already forgotten"]);
         assert!(error.source().is_none());
     }
 
@@ -3760,13 +3840,20 @@ mod tests {
                 Self::Remove(index) => {
                     // One past either end as well, which must be refused.
                     let index = (model.base + index.index(len + 2)).wrapping_sub(1);
-                    let removed = history.try_remove_action_with(index, &mut meter);
+                    let removed =
+                        history.try_remove_action_applied_at_with(Version(index), &mut meter);
                     if index >= model.last() {
-                        assert_eq!(removed, Err(RemoveActionError::IndexOutOfRange(index)));
+                        assert_eq!(
+                            removed,
+                            Err(RemoveActionError::VersionOutOfRange(Version(index)))
+                        );
                         assert_eq!(meter.applications, 0);
                         Ok(())
                     } else if index < model.base {
-                        assert_eq!(removed, Err(RemoveActionError::IndexForgotten(index)));
+                        assert_eq!(
+                            removed,
+                            Err(RemoveActionError::VersionForgotten(Version(index)))
+                        );
                         assert_eq!(meter.applications, 0);
                         Ok(())
                     } else {
@@ -4023,7 +4110,7 @@ mod tests {
                     let mut tally = vec![0; n];
                     let mut removed = tallied.clone();
                     assert_eq!(
-                        removed.remove_action_with(index, &mut tally),
+                        removed.remove_action_applied_at_with(Version(index), &mut tally),
                         Some(Tallied(index))
                     );
                     assert!(
@@ -4051,7 +4138,7 @@ mod tests {
                         let mut removed = history.clone();
                         let mut saved = unlimited();
                         assert_eq!(
-                            removed.try_remove_action_with(index, &mut saved),
+                            removed.try_remove_action_applied_at_with(Version(index), &mut saved),
                             Ok(history.actions[index])
                         );
                         assert_cached_states_match_actions(&removed);
@@ -4075,7 +4162,9 @@ mod tests {
                         let mut spent = unlimited();
                         CLONES.set(0);
                         INVERSIONS.set(0);
-                        unhelped.try_remove_action_with(index, &mut spent).unwrap();
+                        unhelped
+                            .try_remove_action_applied_at_with(Version(index), &mut spent)
+                            .unwrap();
                         assert_eq!(CLONES.get(), replayed);
                         assert_eq!(INVERSIONS.get(), 0);
                         assert_eq!(removed.last_state(), unhelped.last_state());
@@ -4091,7 +4180,10 @@ mod tests {
                         for budget in 0..saved.applications {
                             let mut failed = history.clone();
                             assert_eq!(
-                                failed.try_remove_action_with(index, &mut Meter::limited(budget)),
+                                failed.try_remove_action_applied_at_with(
+                                    Version(index),
+                                    &mut Meter::limited(budget)
+                                ),
                                 Err(RemoveActionError::ActionFailed(Exhausted))
                             );
                             assert_eq!(failed.states, history.states);
@@ -4212,8 +4304,14 @@ mod tests {
         type Remove = RemoveActionError<Coded>;
         assert_eq!(Remove::ActionFailed(Code(1)), Remove::ActionFailed(Code(1)));
         assert_ne!(Remove::ActionFailed(Code(1)), Remove::ActionFailed(Code(2)));
-        assert_ne!(Remove::IndexOutOfRange(1), Remove::IndexOutOfRange(2));
-        assert_ne!(Remove::IndexOutOfRange(1), Remove::IndexForgotten(1));
+        assert_ne!(
+            Remove::VersionOutOfRange(Version(1)),
+            Remove::VersionOutOfRange(Version(2))
+        );
+        assert_ne!(
+            Remove::VersionOutOfRange(Version(1)),
+            Remove::VersionForgotten(Version(1))
+        );
 
         type Get = GetStateError<Coded>;
         assert_eq!(Get::ActionFailed(Code(1)), Get::ActionFailed(Code(1)));
@@ -4339,7 +4437,11 @@ mod tests {
             }
             for index in 0..n {
                 let mut removed = history.clone();
-                assert!(removed.remove_action_with(index, &mut calls).is_some());
+                assert!(
+                    removed
+                        .remove_action_applied_at_with(Version(index), &mut calls)
+                        .is_some()
+                );
                 let mut expected = expected.clone();
                 expected.remove(index);
                 assert_eq!(*removed.last_state(), expected);
