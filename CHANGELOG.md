@@ -11,7 +11,6 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   version of its own, but the state is cloned once for each state the push will keep cached,
   *O*(log *k*) for *k* actions, where pushing them one at a time clones it *k* times. A failed
   `try_push_actions` adds none of them and returns them all in a `PushActionsError`.
-
 - `History::action`, which returns the action at an index. The indices are the ones the
   `remove_action` family takes: they count from the first action ever pushed, so after
   `forget_actions` they are no longer positions in `History::actions`, and looking an action up
@@ -30,12 +29,12 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   every other operation. It used to leave the action moved past some of the actions it commutes
   with. `RemoveActionError::ActionFailed` is accordingly a tuple variant holding only the error,
   no longer a struct variant that also carried the action's new index.
-- Removing an action no longer applies any of the actions it commutes with. The cached states
-  among them are corrected with `Centralizer::inverse` alone, where each used to cost an
-  application as well, and the state the action was applied to is only rebuilt when one of them
-  needs it. Reporting that actions commute now never costs an application over reporting that
-  nothing does; it used to cost more whenever the commuting run ended before the next cached
-  state.
+- Removing an action no longer applies an action to correct a cached state. The cached states
+  among the actions it commutes with are corrected with `Centralizer::inverse` alone, where each
+  used to cost an application as well, and the state the action was applied to is only rebuilt
+  when one of them needs it. Reporting that actions commute now never costs an application over
+  reporting that nothing does; it used to cost more whenever the commuting run ended before the
+  next cached state.
 - `forget_actions` now takes time proportional to the actions it leaves, as documented. It
   copied every action it folded in to a new vector as well. The vector it returns is now the
   buffer the history held, so it can have room for more than it contains.
