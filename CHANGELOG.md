@@ -23,8 +23,11 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   action that commutes with nothing, so a centralizer that reported commuting actions without
   also overriding `inverse` silently produced wrong states. The two can no longer be written
   apart. To migrate, move the body of `inverse` into the `Centralizer` implementation, reading
-  what it needs of the action from the centralizer; an action that uses `NonCommutative` and
-  did not override `inverse` needs no change.
+  what it needs of the action from the centralizer, which may mean keeping more of the action
+  in it: `for_action` is the only place that sees the action, and a centralizer for an action
+  type with parameters of its own generally has to copy what it needs rather than borrow it. An
+  action that uses `NonCommutative` needs no change if it did not override `inverse`, and
+  should just delete the override if it did: it was never called.
 - **Breaking**: a failed `try_remove_action` now leaves the history exactly as it was, like
   every other operation. It used to leave the action moved past some of the actions it commutes
   with. `RemoveActionError::ActionFailed` is accordingly a tuple variant holding only the error,
@@ -32,9 +35,10 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 - Removing an action no longer applies an action to correct a cached state. The cached states
   among the actions it commutes with are corrected with `Centralizer::inverse` alone, where each
   used to cost an application as well, and the state the action was applied to is only rebuilt
-  when one of them needs it. Reporting that actions commute now never costs an application over
-  reporting that nothing does; it used to cost more whenever the commuting run ended before the
-  next cached state.
+  when one of them needs it. None of the actions before the last corrected state is applied
+  again, so removing an action that commutes with everything after it applies none of them.
+  Reporting that actions commute now never costs an application over reporting that nothing
+  does; it used to cost more whenever the commuting run ended before the next cached state.
 - `forget_actions` now takes time proportional to the actions it leaves, as documented. It
   copied every action it folded in to a new vector as well. The vector it returns is now the
   buffer the history held, so it can have room for more than it contains.
@@ -62,8 +66,10 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 - The documentation of the defaults for `Action`'s associated types, which promised them to
   builds that do not have the `associated_type_defaults` feature. The feature is now mentioned
   in the README.
-- The documented cost of a pop, which said that most pops replay nothing. That is true of a pop
-  that undoes the push before it; in a run of pops most replay at least one action.
+- The documented cost of a pop, which said that most pops replay nothing. In a run of pops most
+  replay at least one action. What replays nothing is a pop that undoes the push before it, in
+  a history that has only seen single pushes and pops; after a bulk push, a bulk pop or a
+  removal, the first pop to find a gap those pushes left in the cache fills it.
 - The description of what `forget_actions` bounds, in its documentation and the README. It is
   the number of actions left that is within a factor of what was asked for, not the number
   folded in, which can be none.
@@ -73,4 +79,4 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 - `remove_action` and `pop_actions` no longer apply actions twice while rebuilding the cache.
   The most recent state was replayed from the newest state the operation kept rather than from
   the nearer ones it had just rebuilt, which doubled the applications of a removal with nothing
-  commuting and added up to half again to a bulk pop.
+  commuting and, for a bulk pop, added half again on average and nearly as much again at worst.
