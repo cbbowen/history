@@ -36,6 +36,9 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   needs it. Reporting that actions commute now never costs an application over reporting that
   nothing does; it used to cost more whenever the commuting run ended before the next cached
   state.
+- `forget_actions` now takes time proportional to the actions it leaves, as documented. It
+  copied every action it folded in to a new vector as well. The vector it returns is now the
+  buffer the history held, so it can have room for more than it contains.
 - A removal now relies only on the property `Centralizer` documents. A failure part of the way
   through used to leave cached states that were right only if the actions also commuted in the
   everyday sense, which that property does not imply.
@@ -53,7 +56,18 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   actions after it was said to take *O*(log *n*) applications; reconstructing the state the
   action was applied to makes it linear in the distance to the end, and the bound is amortized
   rather than per call because a removal also repairs the cache as a pop does.
-- `Action::apply_batch` is no longer called with an empty slice.
+- `Action::apply_batch` is no longer called with an empty slice, and the requirements on it and
+  on `Action::apply` are now written down: applying an action must give a state that depends
+  only on the action and the state it is applied to, and must be safe to repeat, because the
+  history applies actions again whenever it rebuilds a state.
+- The documentation of the defaults for `Action`'s associated types, which promised them to
+  builds that do not have the `associated_type_defaults` feature. The feature is now mentioned
+  in the README.
+- The documented cost of a pop, which said that most pops replay nothing. That is true of a pop
+  that undoes the push before it; in a run of pops most replay at least one action.
+- The description of what `forget_actions` bounds, in its documentation and the README. It is
+  the number of actions left that is within a factor of what was asked for, not the number
+  folded in, which can be none.
 - `pop_actions(0)` now does nothing. It used to rebuild whichever cache windows earlier pushes
   had left empty, so a call that removed nothing could apply actions and, for a fallible action,
   fail.

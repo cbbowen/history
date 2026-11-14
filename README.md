@@ -18,6 +18,8 @@ This library provides a middle ground. It stores *O*(log n) states while still a
 
 Implement the [`Action`] trait for your action type, add them to the history with [`History::push_action`], and retrieve the current state with [`History::last_state`]. Remove the most recent action with [`History::pop_action`].
 
+Besides the state, an action names three types: the context it needs to be applied, the error applying it can produce, and the actions it commutes with. The example below uses `()`, `Infallible` and `NonCommutative`, which mean that it needs nothing, cannot fail, and commutes with nothing. On a nightly compiler, the `associated_type_defaults` cargo feature makes those the defaults, so that they can be left out.
+
 ```rust
 enum MyAction {
 	Add(i32),
@@ -50,7 +52,7 @@ assert_eq!(*history.last_state(), 710);
 
 The history above is unbounded: it keeps every action forever, and only the *states* are held to *O*(log n). When that is too much, [`History::forget_actions`] folds the oldest actions into the initial state and drops them, which is the only way anything leaves the front.
 
-It costs nothing to do. The cached states are spaced geometrically backwards from the most recent version, so folding stops at the oldest cached state within reach and there is no state to reconstruct and no action to apply — just the actions to drop. In exchange it folds in only as many as it can reach that way, so it can fall short of what you asked for by a bounded factor; call it again as the history grows and it keeps up.
+It applies no action and clones no state. The cached states are spaced geometrically backwards from the most recent version, so folding stops at a state that is already cached and there is nothing to reconstruct — just the actions to drop. In exchange it folds in only as far as such a state, which can be well short of what you asked for, and nothing at all if you ask for little. What is bounded is what it leaves: ask to keep the most recent *m* actions and fewer than 4*m* remain. So decide what to keep rather than what to drop, and call it again as the history grows.
 
 ```rust
 # enum MyAction { Add(i32), Sub(i32) }
@@ -79,4 +81,4 @@ assert_eq!(*history.last_state(), 499500);
 assert_eq!(history.get_state(history::Version::default()), None);
 ```
 
-Versions are absolute, counting every action ever applied. A [`Version`] held across a fold therefore never comes to mean a different state: either it still names the state it always named, or the operation that takes it says it is gone.
+Versions count from the first action ever pushed, not from the oldest one still held. A [`Version`] held across a fold therefore never comes to mean a different state: either it still names the state it always named, or the operation that takes it says it is gone.

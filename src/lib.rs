@@ -6,30 +6,76 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+// What to say about the usual choice for an associated type of `Action`. It is the default only
+// with the feature that needs a nightly compiler, and the documentation must not promise a
+// default to the builds that do not have one.
+#[cfg(feature = "associated_type_defaults")]
+macro_rules! default_doc {
+    ($usual:expr, $when:expr, $effect:expr) => {
+        concat!("Defaults to ", $usual, ", which ", $effect, ".")
+    };
+}
+#[cfg(not(feature = "associated_type_defaults"))]
+macro_rules! default_doc {
+    ($usual:expr, $when:expr, $effect:expr) => {
+        concat!(
+            "Use ",
+            $usual,
+            " ",
+            $when,
+            ", which ",
+            $effect,
+            ". That is the default with the `associated_type_defaults` cargo feature, which needs a nightly compiler. Without the feature there is no default, and every implementation has to name this type."
+        )
+    };
+}
+
 macro_rules! context_doc {
     () => {
-"Anything applying an action needs that the history does not hold, such as a resource pool or an interner. Every operation that can apply an action takes one by `&mut`.
+        concat!(
+"Anything applying an action needs that the history does not hold, such as an interner or a pool of scratch buffers. Every operation that can apply an action takes one by `&mut`. Actions are applied again whenever a state has to be rebuilt, so whatever applying one does to the context must be safe to repeat: see [`Action::apply`].
 
-Defaults to `()`, which unlocks the shorter methods that do not take one at all."
-    }
+",
+            default_doc!(
+                "`()`",
+                "when applying an action needs nothing more",
+                "unlocks the shorter methods that do not take one at all"
+            )
+        )
+    };
 }
 
 macro_rules! error_doc {
     () => {
+        concat!(
 "The reason applying this action can fail.
 
-Defaults to [`Infallible`](std::convert::Infallible), which unlocks the methods that return the result directly rather than a [`Result`].
+",
+            default_doc!(
+                "[`Infallible`](std::convert::Infallible)",
+                "when applying this action cannot fail",
+                "unlocks the methods that return the result directly rather than a [`Result`]"
+            ),
+"
 
-This crate's error types report a value of this type as their [`source`](std::error::Error::source), so their own [`Display`](std::fmt::Display) says only which operation failed and leaves the reason to the chain."
-    }
+This crate's error types report a value of this type as their [`source`](std::error::Error::source), so their own [`Display`](std::fmt::Display) says only that applying an action failed and leaves the reason to the chain."
+        )
+    };
 }
 
 macro_rules! centralizer_doc {
     () => {
+        concat!(
 "Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to. That is what lets the `remove_action` family correct the cached states after the action it removes rather than replay the actions that led to them.
 
-Defaults to [`NonCommutative`], which never reports that anything commutes: always sound, and never cheaper."
-    }
+",
+            default_doc!(
+                "[`NonCommutative`]",
+                "when removing an action need not be cheap",
+                "never reports that anything commutes: always sound, and never cheaper"
+            )
+        )
+    };
 }
 
 /// An action which can be added to a [`History`].
@@ -59,13 +105,33 @@ pub trait Action: Sized {
     type Centralizer<'a>: Centralizer<'a, Self>;
 
     /// Applies this action to a state, producing a new state.
+    ///
+    /// The history keeps only some of its states and rebuilds the rest by applying actions
+    /// again: when a state is read, when actions are popped, and when one is removed. An action
+    /// can therefore be applied any number of times, to a state it has been applied to before
+    /// or, once an earlier action has been removed, to one it has never seen. So the state this
+    /// returns must depend only on the action and the state it is given, not on what the context
+    /// has been through or on how often this has been called, and whatever it does to the
+    /// context must be harmless to repeat. Interning a string qualifies. Drawing a fresh
+    /// identifier for the state from a counter does not: the same version would then hold a
+    /// different state when it is rebuilt than when it was cached.
+    ///
+    /// An error fails the operation that was applying the action, which leaves the history as
+    /// it was.
     fn apply(
         &self,
         state: Self::State,
         context: &mut Self::Context,
     ) -> Result<Self::State, Self::Error>;
 
-    /// Applies a sequence of actions to a state, producing a new state.
+    /// Applies a sequence of actions to a state in order, producing a new state.
+    ///
+    /// Every state the history rebuilds is rebuilt through this, as is every bulk push; only
+    /// pushing a single action calls [`Self::apply`] directly. Override it if a run of actions
+    /// can be applied more cheaply together than one at a time. An override must return exactly
+    /// what applying each action in turn with [`Self::apply`] would, the error included.
+    /// `actions` is never empty, and can be any consecutive run of actions that a history holds
+    /// or is being given.
     fn apply_batch(
         actions: &[Self],
         mut state: Self::State,
@@ -778,8 +844,11 @@ macro_rules! pop_complexity {
     () => {
         "# Time complexity
 
-Takes *O*(log *n*) amortized time under any interleaving of pushes and pops. Most pops replay
-nothing at all: the state they need is the one the push before them displaced."
+Applies *O*(log *n*) actions amortized, under any interleaving of pushes and pops. A pop that
+undoes the push directly before it applies none: the state it needs is the one that push
+displaced. In a run of pops most apply at least one action and clone one state, about half of
+log₂ *n* applications each on average, and now and then a single pop replays a large part of the
+history."
     };
 }
 
@@ -1354,11 +1423,12 @@ impl<A: Action> History<A> {
     ///
     /// Only as many actions are folded in as can be without replaying any: the fold stops at the
     /// newest already-cached state at or before the `k`th action, so it may fold in fewer than
-    /// `k`, or none at all when no state is cached in between. The shortfall is bounded, because
-    /// the cache is geometrically spaced — asking to keep the most recent *m* actions leaves
-    /// fewer than four times that many — so repeating the call as the history grows keeps it to a
-    /// size. Ask for more than the history holds and it folds in everything, leaving the most
-    /// recent state as the initial one.
+    /// `k`, or none at all when no state is cached in between, which is the usual result of
+    /// asking for only a few. What is bounded is what the fold leaves behind, because the cache
+    /// is geometrically spaced: asking to keep the most recent *m* actions leaves fewer than four
+    /// times that many. So decide what to keep rather than what to drop, and repeating the call
+    /// as the history grows keeps it to a size. Ask for more than the history holds and it folds
+    /// in everything, leaving the most recent state as the initial one.
     ///
     /// # Example
     ///
@@ -1395,9 +1465,10 @@ impl<A: Action> History<A> {
     /// # Time complexity
     ///
     /// Performs no action applications and no state clones. Takes *O*(*m*) time, where *m* is the
-    /// number of actions left afterwards, to shift them down, plus *O*(log *n*) bookkeeping.
-    /// Folding away most of the history is therefore cheap and folding away a little is not, so
-    /// fold in bulk.
+    /// number of actions left afterwards, to move them to a buffer of their own, plus
+    /// *O*(log *n*) bookkeeping; the actions folded in are handed back in the buffer they were
+    /// already in. Folding away most of the history is therefore cheap and folding away a little
+    /// is not, so fold in bulk.
     pub fn forget_actions(&mut self, k: usize) -> Vec<A> {
         let base = self.base();
         let target = base.saturating_add(k).min(self.last_version().0);
@@ -1406,8 +1477,16 @@ impl<A: Action> History<A> {
         let index = self.states.partition_point(|(Version(v), _)| *v <= target) - 1;
         let Version(new_base) = self.states[index].0;
 
+        if new_base == base {
+            return Vec::new();
+        }
+
         self.states.drain(..index);
-        let actions = self.actions.drain(..new_base - base).collect();
+        // Moving the actions that stay, rather than the ones that go, is what makes the cost
+        // that of what is left: draining the front would shift the survivors down as well as
+        // copying everything folded into the vector to return.
+        let kept = self.actions.split_off(new_base - base);
+        let actions = std::mem::replace(&mut self.actions, kept);
 
         // That is the whole repair. Windows are measured from the most recent version, which a
         // fold does not move, so every cached state that survives is exactly as far from the end
@@ -2009,7 +2088,7 @@ mod tests {
     impl Action for TestAction {
         type State = Vec<TestAction>;
 
-        // Defaults.
+        // What the defaults would be.
         type Context = ();
         type Error = Infallible;
         type Centralizer<'a> = NonCommutative;
@@ -2033,7 +2112,7 @@ mod tests {
         type State = Vec<CountedAction>;
         type Context = usize;
 
-        // Defaults.
+        // What the defaults would be.
         type Error = Infallible;
         type Centralizer<'a> = NonCommutative;
 
@@ -2064,7 +2143,7 @@ mod tests {
         type State = Vec<TestAction>;
         type Error = NoAction;
 
-        // Defaults.
+        // What the defaults would be.
         type Context = ();
         type Centralizer<'a> = NonCommutative;
 
@@ -3302,7 +3381,7 @@ mod tests {
             type State = ();
             type Error = OpaqueError;
 
-            // Defaults.
+            // What the defaults would be.
             type Context = ();
             type Centralizer<'a> = NonCommutative;
 
@@ -3862,6 +3941,88 @@ mod tests {
         }
         // Enough of them that the enumeration is plainly not vacuous.
         assert!(caches > 3000, "only {caches} caches were admissible");
+    }
+
+    /// An action whose [`Action::apply_batch`] is not a loop over [`Action::apply`], and which
+    /// keeps count of the calls to each. Its batches refuse to be empty.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Batched(u8);
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Calls {
+        single: usize,
+        batched: usize,
+    }
+
+    impl Action for Batched {
+        type State = Vec<u8>;
+        type Context = Calls;
+        type Error = Infallible;
+        type Centralizer<'a> = NonCommutative;
+
+        fn apply(&self, mut state: Vec<u8>, calls: &mut Calls) -> Result<Vec<u8>, Infallible> {
+            calls.single += 1;
+            state.push(self.0);
+            Ok(state)
+        }
+
+        fn apply_batch(
+            actions: &[Self],
+            mut state: Vec<u8>,
+            calls: &mut Calls,
+        ) -> Result<Vec<u8>, Infallible> {
+            assert!(!actions.is_empty(), "asked to apply no actions");
+            calls.batched += 1;
+            state.extend(actions.iter().map(|action| action.0));
+            Ok(state)
+        }
+    }
+
+    /// Everything but the push of a single action goes through [`Action::apply_batch`], which
+    /// is never handed an empty run: an override may rely on both.
+    #[test]
+    fn replays_go_through_apply_batch() {
+        for n in [0usize, 1, 2, 9, 40, 100] {
+            let mut calls = Calls::default();
+            let mut history = History::<Batched>::default();
+            for i in 0..n {
+                history.push_action_with(Batched(i as u8), &mut calls);
+            }
+            assert_eq!(
+                calls,
+                Calls {
+                    single: n,
+                    batched: 0
+                }
+            );
+
+            let expected: Vec<u8> = (0..n).map(|i| i as u8).collect();
+            for version in history.versions() {
+                assert_eq!(
+                    history.get_state_with(version, &mut calls).as_deref(),
+                    Some(&expected[..version.index()])
+                );
+            }
+            for index in 0..n {
+                let mut removed = history.clone();
+                assert!(removed.remove_action_with(index, &mut calls).is_some());
+                let mut expected = expected.clone();
+                expected.remove(index);
+                assert_eq!(*removed.last_state(), expected);
+            }
+            for k in 0..=n + 1 {
+                let mut popped = history.clone();
+                popped.pop_actions_with(k, &mut calls);
+                assert_eq!(*popped.last_state(), expected[..n.saturating_sub(k)]);
+
+                let mut pushed = history.clone();
+                pushed.push_actions_with(vec![Batched(7); k], &mut calls);
+                assert_eq!(pushed.last_state()[..n], expected);
+                assert_eq!(pushed.last_state()[n..], vec![7; k]);
+            }
+            while history.pop_action_with(&mut calls).is_some() {}
+            assert_eq!(calls.single, n);
+        }
     }
 
     /// Undoing everything applies *O*(log *n*) actions per pop: no more than one for each window
