@@ -49,6 +49,10 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   need the nightly-only `associated_type_defaults` cargo feature. Without it the crate builds on
   stable, and every implementation has to name all three types.
 
+- The time complexity sections now give asymptotic bounds only, amortized and worst case, with
+  what they count stated once on `History`. They no longer describe how many applications or
+  clones an operation happens to perform, or when the cache makes one cheaper.
+
 ### Fixed
 
 - The documentation of `Version`, which said that a version is the index that removes the
@@ -58,7 +62,9 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 - The documented cost of the `remove_action` family. Removing an action that commutes with the
   actions after it was said to take *O*(log *n*) applications; reconstructing the state the
   action was applied to makes it linear in the distance to the end, and the bound is amortized
-  rather than per call because a removal also repairs the cache as a pop does.
+  rather than per call because a removal also repairs the cache as a pop does. It is now given
+  as *O*(*m* + log *n*) amortized for *m* actions after the index, and *O*(*n*) in the worst
+  case.
 - `Action::apply_batch` is no longer called with an empty slice, and the requirements on it and
   on `Action::apply` are now written down: applying an action must give a state that depends
   only on the action and the state it is applied to, and must be safe to repeat, because the
@@ -66,10 +72,10 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 - The documentation of the defaults for `Action`'s associated types, which promised them to
   builds that do not have the `associated_type_defaults` feature. The feature is now mentioned
   in the README.
-- The documented cost of a pop, which said that most pops replay nothing. In a run of pops most
-  replay at least one action. What replays nothing is a pop that undoes the push before it, in
-  a history that has only seen single pushes and pops; after a bulk push, a bulk pop or a
-  removal, the first pop to find a gap those pushes left in the cache fills it.
+- The documented cost of a pop, which said that most pops replay nothing. That is true only of
+  a pop that undoes the push before it, and then only in a history of single pushes and pops; in
+  a run of pops most replay at least one action. The documentation now gives the bounds alone:
+  *O*(log *n*) amortized and *O*(*n*) in the worst case.
 - The description of what `forget_actions` bounds, in its documentation and the README. It is
   the number of actions left that is within a factor of what was asked for, not the number
   folded in, which can be none.

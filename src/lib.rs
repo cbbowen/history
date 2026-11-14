@@ -609,6 +609,11 @@ struct Popped<A: Action> {
 }
 
 /// The history of state as actions are applied to it.
+///
+/// # Time complexity
+///
+/// The time each operation is documented to take counts applying an action, cloning a state and
+/// moving an action as constant time each, and *n* is the number of actions the history holds.
 #[derive(Debug, Clone)]
 pub struct History<A: Action> {
     actions: Vec<A>,
@@ -802,7 +807,7 @@ macro_rules! remove_example {
             "history.push_action(Set(0, 1));
 history.push_action(Set(1, 2));
 assert_eq!(*history.last_state(), vec![1, 2]);
-// `Set(0, 1)` commutes with `Set(1, 2)`, so this removal applies nothing: see `Centralizer`.
+// `Set(0, 1)` commutes with `Set(1, 2)`, which is not applied again: see `Centralizer`.
 assert_eq!(",
             $call,
             ", ",
@@ -826,7 +831,7 @@ macro_rules! push_complexity {
     () => {
         "# Time complexity
 
-Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping."
+Takes *O*(log *n*) amortized time, and *O*(*n*) time in the worst case."
     };
 }
 
@@ -834,9 +839,8 @@ macro_rules! push_actions_complexity {
     () => {
         "# Time complexity
 
-Performs exactly one application for each action pushed and *O*(log *k*) state clones, where *k*
-is how many there are, plus *O*(log *n*) bookkeeping. Pushing them one at a time clones the state
-*k* times, to cache states that all but *O*(log *k*) of the later pushes then drop."
+Takes *O*(*k* + log *n*) amortized time, where *k* is the number of actions pushed, and
+*O*(*k* + *n*) time in the worst case."
     };
 }
 
@@ -844,13 +848,8 @@ macro_rules! pop_complexity {
     () => {
         "# Time complexity
 
-Applies *O*(log *n*) actions amortized, under any interleaving of pushes and pops. In a history
-that only pushes and pops of single actions have touched, a pop that undoes the push directly
-before it applies none: the state it needs is the one that push displaced. After a bulk push, a
-bulk pop or a removal, the pushes that follow can leave a gap in the cache, and the first pop to
-find it there fills it. In a run of pops most apply at least one action and clone one state, and
-now and then one replays a large part of the history, which averages out at a fraction of
-log₂ *n* applications each."
+Takes *O*(log *n*) amortized time over any sequence of pushes and pops, and *O*(*n*) time in the
+worst case."
     };
 }
 
@@ -858,26 +857,16 @@ macro_rules! pop_actions_complexity {
     () => {
         "# Time complexity
 
-Takes *O*(*k* (1 + log (*n*/*k*))) amortized time."
+Takes *O*(*k* (1 + log (*n*/*k*))) amortized time, and *O*(*n*) time in the worst case."
     };
 }
 
 macro_rules! remove_complexity {
     () => {
-"# Time complexity
+        "# Time complexity
 
-Applies no action more than once: the actions after `index` and, to reach them, the actions
-between the cached state before `index` and `index` itself, of which there are fewer than three
-for each action from `index` on. That is *O*(*n*) applications, where *n* is the number of actions
-after `index`, plus the cache repair a pop also performs among the states before `index`, which is
-*O*(log *N*) amortized over the *N* actions the history holds but can be a large part of the
-history for a single call.
-
-The consecutive actions after `index` that the removed action commutes with are not replayed
-where a cached state lies beyond them. Each cached state among them is corrected instead, with one
-clone and one [`Centralizer::inverse`], and there are *O*(log *n*) of them. This saves a constant
-factor rather than improving the bound: the corrections start from the state the removed action
-was applied to, and reconstructing that is the replay from the cached state before `index`."
+Takes *O*(*m* + log *n*) amortized time, where *m* is the number of actions after `index`, and
+*O*(*n*) time in the worst case."
     };
 }
 
@@ -1474,11 +1463,7 @@ impl<A: Action> History<A> {
     ///
     /// # Time complexity
     ///
-    /// Performs no action applications and no state clones. Takes *O*(*m*) time, where *m* is the
-    /// number of actions left afterwards, to move them to a buffer of their own, plus
-    /// *O*(log *n*) bookkeeping; the actions folded in are handed back in the buffer they were
-    /// already in. Folding away most of the history is therefore cheap and folding away a little
-    /// is not, so fold in bulk.
+    /// Takes *O*(*m* + log *n*) time, where *m* is the number of actions left afterwards.
     pub fn forget_actions(&mut self, k: usize) -> Vec<A> {
         let base = self.base();
         let target = base.saturating_add(k).min(self.last_version().0);
