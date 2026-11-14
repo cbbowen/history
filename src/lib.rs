@@ -2868,32 +2868,43 @@ mod tests {
 
     proptest! {
         #[test]
+        /// A push fails exactly when its action does, and then hands the action back and
+        /// leaves the history as it was.
         fn try_push_action(mut history: History<Option<TestAction>>, action: Option<TestAction>) {
-            let previous_version = history.last_version();
-            let mut actions = Vec::from_iter(history.actions().cloned());
-            let must_succeed = actions.iter().all(|a| a.is_some()) && action.is_some();
-            if let Ok(new_version) = history.try_push_action(action) {
-                prop_assert_eq!(history.last_version(), new_version);
-                prop_assert!(new_version > previous_version);
-                actions.push(action);
-            } else {
-                prop_assert!(!must_succeed);
+            let before = history.clone();
+            match history.try_push_action(action) {
+                Ok(new_version) => {
+                    prop_assert!(action.is_some());
+                    prop_assert_eq!(history.last_version(), new_version);
+                    prop_assert_eq!(new_version.index(), before.last_version().index() + 1);
+                    prop_assert_eq!(history.actions().last(), Some(&action));
+                    prop_assert_eq!(history.actions().len(), before.actions().len() + 1);
+                }
+                Err(error) => {
+                    prop_assert_eq!(action, None);
+                    prop_assert_eq!(*error.action(), None);
+                    prop_assert_eq!(*error.error(), NoAction);
+                    prop_assert_eq!(error.into_parts(), (None, NoAction));
+                    prop_assert_eq!(&history.actions, &before.actions);
+                    prop_assert_eq!(&history.states, &before.states);
+                }
             }
-            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
 
+        /// An action that fails is never pushed, so a history of these never holds one and its
+        /// pops cannot fail. What a pop does when a replay *does* fail is for the tests of
+        /// [`Mix`], whose failures come from the context rather than from the action.
         #[test]
         fn try_pop_action(mut history: History<Option<TestAction>>) {
+            prop_assert!(history.actions().all(Option::is_some));
             let previous_version = history.last_version();
             let mut actions = Vec::from_iter(history.actions().cloned());
-            let must_succeed = actions.iter().all(|a| a.is_some());
-            if let Ok(action) = history.try_pop_action() {
-                prop_assert_eq!(action, actions.pop());
-                prop_assert!(history.last_version() <= previous_version);
-                prop_assert!(action.is_none() || history.last_version() < previous_version);
-            } else {
-                prop_assert!(!must_succeed);
-            }
+            let action = history.try_pop_action().unwrap();
+            prop_assert_eq!(action, actions.pop());
+            prop_assert_eq!(
+                history.last_version().index() + usize::from(action.is_some()),
+                previous_version.index()
+            );
             prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
         }
     }
@@ -3341,25 +3352,52 @@ mod tests {
         );
         assert!(error.source().unwrap().is::<NoAction>());
 
-        // A pop only fails when a replay does, which needs an action that succeeds once and then
-        // refuses, so the error is built directly rather than provoked.
-        let error = PopError::<Option<TestAction>>(NoAction);
-        assert_eq!(
-            chain(&error),
-            ["failed to apply action", "there is no action to apply"]
-        );
+        // The other operations only fail when a replay does, which takes an action that
+        // succeeds when it is pushed and refuses later.
+        let spent = ["failed to apply action", "the meter is spent"];
+        let pushed = mixed_history::<false>((0..64).map(|i| i % SLOT_COUNT));
 
-        let error = RemoveActionError::<Option<TestAction>>::ActionFailed(NoAction);
-        assert_eq!(
-            chain(&error),
-            ["failed to apply action", "there is no action to apply"]
-        );
+        let error = pushed
+            .clone()
+            .try_push_actions_with(pushed.actions.clone(), &mut Meter::limited(1))
+            .unwrap_err();
+        assert_eq!(chain(&error), spent);
+        assert!(error.source().unwrap().is::<Exhausted>());
 
-        let error = GetStateError::<Option<TestAction>>::ActionFailed(NoAction);
-        assert_eq!(
-            chain(&error),
-            ["failed to apply action", "there is no action to apply"]
-        );
+        let mut history = pushed.clone();
+        let error = loop {
+            match history.try_pop_action_with(&mut Meter::limited(0)) {
+                Ok(popped) => assert!(popped.is_some(), "no pop needed a replay"),
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(chain(&error), spent);
+        assert_eq!(*error.error(), Exhausted);
+        assert_eq!(error.into_error(), Exhausted);
+
+        let error = pushed
+            .clone()
+            .try_pop_actions_with(7, &mut Meter::limited(0))
+            .unwrap_err();
+        assert_eq!(chain(&error), spent);
+
+        let error = pushed
+            .clone()
+            .try_remove_action_with(0, &mut Meter::limited(0))
+            .unwrap_err();
+        assert_eq!(error, RemoveActionError::ActionFailed(Exhausted));
+        assert_eq!(chain(&error), spent);
+
+        let error = pushed
+            .versions()
+            .find_map(|version| {
+                pushed
+                    .try_get_state_with(version, &mut Meter::limited(0))
+                    .err()
+            })
+            .expect("no version needed a replay");
+        assert_eq!(error, GetStateError::ActionFailed(Exhausted));
+        assert_eq!(chain(&error), spent);
 
         // The out-of-range errors have nothing underneath them.
         let error = History::<Option<TestAction>>::default()
@@ -3388,6 +3426,462 @@ mod tests {
         let error = history.try_remove_action(1).unwrap_err();
         assert_eq!(chain(&error), ["action index already forgotten"]);
         assert!(error.source().is_none());
+    }
+
+    /// A plain account of what a history of [`Mix`] actions should hold, to check one against.
+    #[derive(Clone, Debug)]
+    struct Model {
+        base: usize,
+        initial: Slots,
+        actions: Vec<Mix<true>>,
+    }
+
+    impl Model {
+        fn new() -> Self {
+            Self {
+                base: 0,
+                initial: Slots::default(),
+                actions: Vec::new(),
+            }
+        }
+
+        fn last(&self) -> usize {
+            self.base + self.actions.len()
+        }
+
+        /// The state at every version from the initial one on.
+        fn states(&self) -> Vec<Slots> {
+            let mut states = vec![self.initial.clone()];
+            for action in &self.actions {
+                let state = states.last().unwrap().clone();
+                states.push(action.apply(state, &mut Meter::unlimited()).unwrap());
+            }
+            states
+        }
+
+        /// Panics unless `history` holds exactly this: the same actions from the same initial
+        /// state at the same versions, and a cache within its invariant in which every state is
+        /// the one those actions produce.
+        fn assert_matches(&self, history: &History<Mix<true>>) {
+            assert_eq!(history.initial_version(), Version(self.base));
+            assert_eq!(history.last_version(), Version(self.last()));
+            assert_eq!(history.actions, self.actions);
+            let states = self.states();
+            assert_eq!(*history.initial_state(), states[0]);
+            assert_eq!(history.last_state(), states.last().unwrap());
+            for (version, state) in &history.states {
+                assert_eq!(
+                    *state,
+                    states[version.index() - self.base],
+                    "the cached state at {version:?} is wrong"
+                );
+            }
+            history.assert_cache_invariant();
+        }
+    }
+
+    /// One operation on a history of [`Mix`] actions. As with [`Step`], counts and indices are
+    /// fractions of what the history holds.
+    #[derive(Clone, Debug)]
+    enum Operation {
+        Push(Mix<true>),
+        PushActions(Vec<Mix<true>>),
+        Pop,
+        PopState,
+        PopActions(prop::sample::Index),
+        Remove(prop::sample::Index),
+        Forget(prop::sample::Index),
+        GetState(prop::sample::Index),
+    }
+
+    impl Operation {
+        fn strategy() -> impl Strategy<Value = Self> {
+            let index = any::<prop::sample::Index>;
+            prop_oneof![
+                12 => Mix::strategy().prop_map(Self::Push),
+                2 => prop::collection::vec(Mix::strategy(), 0..48).prop_map(Self::PushActions),
+                5 => Just(Self::Pop),
+                1 => Just(Self::PopState),
+                1 => index().prop_map(Self::PopActions),
+                3 => index().prop_map(Self::Remove),
+                1 => index().prop_map(Self::Forget),
+                3 => index().prop_map(Self::GetState),
+            ]
+        }
+
+        /// Performs this operation on both `history` and `model`, allowing it `budget`
+        /// applications, and panics if the history does anything but what the model says it
+        /// should: on success, the same results at a cost within what is documented, and on
+        /// failure, nothing at all.
+        fn run(self, history: &mut History<Mix<true>>, model: &mut Model, budget: usize) {
+            let before = history.clone();
+            let mut meter = Meter::limited(budget);
+            let len = model.actions.len();
+            let states = model.states();
+
+            let outcome = match self {
+                Self::Push(action) => history
+                    .try_push_action_with(action, &mut meter)
+                    .map(|version| {
+                        assert_eq!(meter.applications, 1);
+                        model.actions.push(action);
+                        assert_eq!(version, Version(model.last()));
+                    })
+                    .map_err(|error| assert_eq!(error.into_parts(), (action, Exhausted))),
+                Self::PushActions(actions) => history
+                    .try_push_actions_with(actions.clone(), &mut meter)
+                    .map(|version| {
+                        assert_eq!(meter.applications, actions.len());
+                        model.actions.extend(&actions);
+                        assert_eq!(version, Version(model.last()));
+                    })
+                    .map_err(|error| assert_eq!(error.into_parts(), (actions, Exhausted))),
+                Self::Pop => history
+                    .try_pop_action_and_state_with(&mut meter)
+                    .map(|popped| {
+                        let state = states.last().unwrap().clone();
+                        assert_eq!(popped, model.actions.pop().map(|action| (action, state)));
+                        if len > 0 {
+                            history.assert_every_window_occupied();
+                        }
+                    })
+                    .map_err(|error| assert_eq!(error.into_error(), Exhausted)),
+                Self::PopState => history
+                    .try_pop_state_with(&mut meter)
+                    .map(|popped| {
+                        let state = states.last().unwrap().clone();
+                        assert_eq!(popped, model.actions.pop().map(|_| state));
+                    })
+                    .map_err(|error| assert_eq!(error.into_error(), Exhausted)),
+                Self::PopActions(k) => {
+                    let k = k.index(len + 2);
+                    history
+                        .try_pop_actions_with(k, &mut meter)
+                        .map(|popped| {
+                            let kept = len.saturating_sub(k);
+                            let mut expected = model.actions.split_off(kept);
+                            expected.reverse();
+                            assert_eq!(popped, expected);
+                            if k == 0 {
+                                assert_eq!(meter.applications, 0);
+                                assert_eq!(history.states, before.states);
+                            } else if len > 0 {
+                                history.assert_every_window_occupied();
+                            }
+                        })
+                        .map_err(|error| assert_eq!(error.into_error(), Exhausted))
+                }
+                Self::Remove(index) => {
+                    // One past either end as well, which must be refused.
+                    let index = (model.base + index.index(len + 2)).wrapping_sub(1);
+                    let removed = history.try_remove_action_with(index, &mut meter);
+                    if index >= model.last() {
+                        assert_eq!(removed, Err(RemoveActionError::IndexOutOfRange(index)));
+                        assert_eq!(meter.applications, 0);
+                        Ok(())
+                    } else if index < model.base {
+                        assert_eq!(removed, Err(RemoveActionError::IndexForgotten(index)));
+                        assert_eq!(meter.applications, 0);
+                        Ok(())
+                    } else {
+                        removed
+                            .map(|removed| {
+                                assert_eq!(removed, model.actions.remove(index - model.base));
+                                history.assert_every_window_occupied();
+                            })
+                            .map_err(|error| {
+                                assert_eq!(error, RemoveActionError::ActionFailed(Exhausted))
+                            })
+                    }
+                }
+                Self::Forget(k) => {
+                    let k = k.index(len + 2);
+                    let folded = history.forget_actions(k);
+                    assert!(folded.len() <= k);
+                    assert_eq!(folded, model.actions[..folded.len()]);
+                    // Asking to keep the most recent `m` leaves fewer than four times as many.
+                    let (kept, wanted) = (len - folded.len(), len.saturating_sub(k));
+                    assert!(kept >= wanted);
+                    assert!(
+                        kept == 0 || kept < 4 * wanted,
+                        "{kept} actions left where {wanted} were to be kept"
+                    );
+                    model.actions.drain(..folded.len());
+                    model.initial = states[folded.len()].clone();
+                    model.base += folded.len();
+                    Ok(())
+                }
+                Self::GetState(version) => {
+                    let back = version.index(len + 1);
+                    let version = Version(model.last() - back);
+                    history
+                        .try_get_state_with(version, &mut meter)
+                        .map(|state| {
+                            assert_eq!(state, states[len - back]);
+                            // Linear in how far back the version is, whatever the cache holds.
+                            assert!(
+                                meter.applications < (3 * back).max(1),
+                                "{} applications to go back {back}",
+                                meter.applications
+                            );
+                        })
+                        .map_err(|error| assert_eq!(error, GetStateError::ActionFailed(Exhausted)))
+                }
+            };
+
+            match outcome {
+                Ok(()) => assert!(meter.applications <= budget),
+                Err(()) => {
+                    // Only a spent meter makes anything fail, and a failure changes nothing.
+                    assert_eq!(meter.applications, budget);
+                    assert_eq!(history.actions, before.actions);
+                    assert_eq!(history.states, before.states);
+                }
+            }
+            model.assert_matches(history);
+        }
+    }
+
+    proptest! {
+        /// Whatever is done to a history, in whatever order and whether or not it succeeds, the
+        /// history must go on holding exactly what a plain list of its actions says it should.
+        /// About one operation in five is given too few applications to finish, so that every
+        /// operation is also seen failing part of the way through its work.
+        #[test]
+        fn every_operation_agrees_with_a_model(
+            prefill in prop::collection::vec(Mix::strategy(), 0..300),
+            operations in prop::collection::vec(
+                (Operation::strategy(), prop::option::weighted(0.2, 0usize..24)),
+                0..120,
+            ),
+        ) {
+            let mut history = History::default();
+            let mut model = Model::new();
+            Operation::PushActions(prefill).run(&mut history, &mut model, usize::MAX);
+            for (operation, budget) in operations {
+                operation.run(&mut history, &mut model, budget.unwrap_or(usize::MAX));
+            }
+        }
+    }
+
+    /// Every set of versions the cache of a history of `n` actions may hold: the initial version
+    /// and the last two, at most two to a window, and each less than four times as far from the
+    /// end as the next nearer one. Most of these no sequence of operations reaches, which is the
+    /// point: the operations are meant to work on whatever the invariant admits, so that an
+    /// argument from the invariant is an argument about them.
+    fn admissible_caches(n: usize) -> Vec<Vec<usize>> {
+        let interior = n.saturating_sub(2);
+        (0u32..1 << interior)
+            .map(|mask| {
+                let mut versions = vec![0];
+                versions.extend((1..=interior).filter(|version| mask >> (version - 1) & 1 == 1));
+                versions.extend((n.saturating_sub(1)..=n).filter(|version| *version > 0));
+                versions
+            })
+            .filter(|versions| {
+                let spaced = versions
+                    .windows(2)
+                    .all(|pair| n - pair[0] < 4 * (n - pair[1] + 1));
+                let crowded = (0..usize::BITS).any(|scale| {
+                    let held = versions
+                        .iter()
+                        .filter(|version| (n - *version) >> scale == 1);
+                    held.count() > 2
+                });
+                spaced && !crowded
+            })
+            .collect()
+    }
+
+    /// Builds a history of an action on each of `slots` whose cache holds exactly `versions`.
+    fn history_with_cache<const COMMUTES: bool>(
+        slots: &[usize],
+        versions: &[usize],
+    ) -> History<Mix<COMMUTES>> {
+        let mut history = mixed_history::<COMMUTES>(slots.iter().copied());
+        let meter = &mut Meter::unlimited();
+        history.states = versions
+            .iter()
+            .map(|version| {
+                let version = Version(*version);
+                (version, history.try_get_state_with(version, meter).unwrap())
+            })
+            .collect();
+        history.assert_cache_invariant();
+        history
+    }
+
+    /// Every operation must do its job from any cache the invariant admits, and leave a cache
+    /// the invariant admits behind. Checked for every such cache of every history short enough
+    /// to enumerate them, against histories built the plain way.
+    #[test]
+    fn every_operation_works_from_every_admissible_cache() {
+        let unlimited = Meter::unlimited;
+        let mut caches = 0;
+        for n in 0usize..=16 {
+            let slots: Vec<usize> = (0..n).map(|i| (i * 7 / 3) % 3).collect();
+            let plain = mixed_history::<true>(slots.iter().copied());
+            let expected = |history: &History<Mix<true>>, version| {
+                history.try_get_state_with(version, &mut unlimited())
+            };
+
+            for versions in admissible_caches(n) {
+                caches += 1;
+                let history = history_with_cache::<true>(&slots, &versions);
+                let unhelped = history_with_cache::<false>(&slots, &versions);
+                assert_cached_states_match_actions(&history);
+
+                // Reading a state, in time linear in how far back it is.
+                for version in history.versions() {
+                    let mut meter = unlimited();
+                    assert_eq!(
+                        history.try_get_state_with(version, &mut meter),
+                        expected(&plain, version)
+                    );
+                    let back = n - version.index();
+                    assert!(
+                        meter.applications < (3 * back).max(1),
+                        "{} applications to go back {back} with {versions:?} cached",
+                        meter.applications
+                    );
+                }
+
+                // Pushing, one action and several.
+                let pushed = Mix { slot: 1, value: 9 };
+                let mut longer = history.clone();
+                let mut meter = unlimited();
+                longer.try_push_action_with(pushed, &mut meter).unwrap();
+                assert_eq!(meter.applications, 1);
+                assert_cached_states_match_actions(&longer);
+                longer.assert_cache_invariant();
+                for k in 0usize..=9 {
+                    let mut longer = history.clone();
+                    let mut meter = unlimited();
+                    longer
+                        .try_push_actions_with(vec![pushed; k], &mut meter)
+                        .unwrap();
+                    assert_eq!(meter.applications, k);
+                    assert_eq!(longer.actions.len(), n + k);
+                    assert_cached_states_match_actions(&longer);
+                    longer.assert_cache_invariant();
+                }
+
+                // Popping, one action and several.
+                for k in 0..=n + 1 {
+                    let mut shorter = history.clone();
+                    let popped = shorter.try_pop_actions_with(k, &mut unlimited()).unwrap();
+                    assert_eq!(popped.len(), k.min(n));
+                    assert_eq!(shorter.actions, history.actions[..n - k.min(n)]);
+                    assert_cached_states_match_actions(&shorter);
+                    if k == 0 {
+                        assert_eq!(shorter.states, history.states);
+                    } else {
+                        shorter.assert_every_window_occupied();
+                    }
+
+                    if k == 1 {
+                        let mut singly = history.clone();
+                        let popped = singly.try_pop_action_and_state_with(&mut unlimited());
+                        let state = history.last_state().clone();
+                        assert_eq!(
+                            popped,
+                            Ok(history.actions.last().map(|last| (*last, state)))
+                        );
+                        assert_eq!(singly.states, shorter.states);
+                    }
+                }
+
+                // Forgetting, which neither replays nor leaves more than it may.
+                for k in 0..=n + 1 {
+                    let mut folded = history.clone();
+                    let forgotten = folded.forget_actions(k);
+                    assert!(forgotten.len() <= k);
+                    assert_eq!(forgotten, history.actions[..forgotten.len()]);
+                    assert_eq!(folded.initial_version(), Version(forgotten.len()));
+                    assert_eq!(folded.last_version(), Version(n));
+                    assert_eq!(
+                        Ok(folded.initial_state().clone()),
+                        expected(&plain, folded.initial_version())
+                    );
+                    assert_cached_states_match_actions(&folded);
+                    folded.assert_cache_invariant();
+                    let (kept, wanted) = (folded.actions.len(), n.saturating_sub(k));
+                    assert!(
+                        kept == 0 || kept < 4 * wanted,
+                        "{kept} left of {versions:?} where {wanted} were to be kept"
+                    );
+                }
+
+                // Removing, with and without the help of a centralizer, and failing at every
+                // point along the way.
+                for index in 0..n {
+                    let mut remaining = slots.clone();
+                    remaining.remove(index);
+                    let mut removed = history.clone();
+                    let mut saved = unlimited();
+                    assert_eq!(
+                        removed.try_remove_action_with(index, &mut saved),
+                        Ok(history.actions[index])
+                    );
+                    assert_cached_states_match_actions(&removed);
+                    removed.assert_every_window_occupied();
+                    assert_eq!(removed.actions.len(), n - 1);
+                    assert_eq!(
+                        removed
+                            .actions
+                            .iter()
+                            .map(|action| action.slot)
+                            .collect::<Vec<_>>(),
+                        remaining
+                    );
+
+                    let mut unhelped = unhelped.clone();
+                    let mut spent = unlimited();
+                    unhelped.try_remove_action_with(index, &mut spent).unwrap();
+                    assert_eq!(removed.last_state(), unhelped.last_state());
+                    assert_cached_states_match_actions(&unhelped);
+                    assert!(
+                        saved.applications <= spent.applications,
+                        "removing {index} with {versions:?} cached applied {} actions where it \
+                         applies {} with nothing commuting",
+                        saved.applications,
+                        spent.applications,
+                    );
+
+                    for budget in 0..saved.applications {
+                        let mut failed = history.clone();
+                        assert_eq!(
+                            failed.try_remove_action_with(index, &mut Meter::limited(budget)),
+                            Err(RemoveActionError::ActionFailed(Exhausted))
+                        );
+                        assert_eq!(failed.states, history.states);
+                        assert_eq!(failed.actions, history.actions);
+                    }
+                }
+            }
+        }
+        // Enough of them that the enumeration is plainly not vacuous.
+        assert!(caches > 3000, "only {caches} caches were admissible");
+    }
+
+    /// Undoing everything applies *O*(log *n*) actions per pop: no more than one for each window
+    /// the history has, on average, and in fact about half that.
+    #[test]
+    fn popping_everything_is_logarithmic_per_pop() {
+        for n in [1usize, 2, 3, 10, 100, 1000, 4096, 10_000] {
+            let mut history = counted_history(n);
+            let mut applications = 0;
+            for remaining in (0..n).rev() {
+                assert!(history.pop_action_with(&mut applications).is_some());
+                assert_eq!(history.last_version(), Version(remaining));
+            }
+            assert_eq!(history.pop_action_with(&mut applications), None);
+            let windows = History::<CountedAction>::window_count(n) as usize;
+            assert!(
+                applications <= n * windows,
+                "popping all of {n} actions applied {applications}"
+            );
+        }
     }
 
     #[test]
