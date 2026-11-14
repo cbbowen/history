@@ -80,19 +80,25 @@ pub trait Action: Sized {
 
 /// Identifies a specific version in the history.
 ///
-/// Version `i` is the state reached by applying the first `i` actions, so it is also the index of
-/// the action that produced it plus one, and the index the `remove_action` family takes to remove
-/// that action.
+/// Version `i` is the state reached by applying the first `i` actions. The action applied *to*
+/// it, which leads to version `i + 1`, is the action with index `i`: that is the number
+/// [`History::action`] and the `remove_action` family take. The action that *produced* version
+/// `i` is therefore the one with index `i - 1`.
 ///
-/// Versions are absolute: they count every action ever applied, including the ones
-/// `forget_actions` has folded into the initial state. A version that names a folded-away
-/// state stays meaningful — it is simply no longer reachable, and the operations that take one
-/// say so rather than answering about a different state.
+/// Versions count from the first action ever pushed, including the actions `forget_actions` has
+/// since folded into the initial state, so a fold never renumbers anything. A version that names
+/// a folded-away state stays meaningful — it is simply no longer reachable, and the operations
+/// that take one say so rather than answering about a different state.
+///
+/// Shortening the history is another matter. After a pop, the next push reuses the number of the
+/// version that went, and removing an action moves every later version down by one. A version
+/// held across either names whichever state has its number now.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version(usize);
 
 impl Version {
-    /// Returns the number of actions applied to reach this version.
+    /// Returns the number of actions applied to reach this version, which is also the index of
+    /// the action applied to it.
     pub fn index(self) -> usize {
         self.0
     }
@@ -883,10 +889,59 @@ impl<A: Action> History<A> {
         A::apply_batch(self.action_range(from, to), state, context)
     }
 
+    /// Returns the action at `index`, which is the action that transforms the state at version
+    /// `index` into the state at the following version. Returns `None` if the history does not
+    /// hold it, either because there is no such action yet or because [`Self::forget_actions`]
+    /// has folded it into the initial state.
+    ///
+    /// These are the indices the `remove_action` family takes. They count from the first action
+    /// ever pushed, not from the oldest one the history still holds, so they are positions in
+    /// [`Self::actions`] only until a fold: after one, the action at position `p` there has
+    /// index `initial_version().index() + p`. Pairing [`Self::versions`] with [`Self::actions`]
+    /// gives each action alongside the version whose index it has.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use history::*;
+    /// # #[derive(Debug, PartialEq, Eq)]
+    /// # struct Add(i32);
+    /// # impl Action for Add {
+    /// #  type State = i32;
+    /// #  type Context = ();
+    /// #  type Error = std::convert::Infallible;
+    /// #  type Centralizer<'a> = NonCommutative;
+    /// #  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+    /// # }
+    /// # let mut history = History::default();
+    /// history.push_action(Add(1));
+    /// history.push_action(Add(2));
+    /// history.push_action(Add(3));
+    /// assert_eq!(history.action(0), Some(&Add(1)));
+    ///
+    /// // A fold drops the oldest actions without renumbering the rest.
+    /// assert_eq!(history.forget_actions(1), vec![Add(1)]);
+    /// assert_eq!(history.action(0), None);
+    /// assert_eq!(history.action(1), Some(&Add(2)));
+    ///
+    /// // So to find the index of an action, look for it alongside the versions.
+    /// let index = history
+    ///     .versions()
+    ///     .zip(history.actions())
+    ///     .find(|(_, action)| **action == Add(3))
+    ///     .map(|(version, _)| version.index());
+    /// assert_eq!(index, Some(2));
+    /// assert_eq!(history.remove_action(2), Some(Add(3)));
+    /// ```
+    pub fn action(&self, index: usize) -> Option<&A> {
+        self.actions.get(index.checked_sub(self.base())?)
+    }
+
     /// Returns all the actions the history still holds, from oldest to newest.
     ///
     /// [`Self::forget_actions`] drops the actions it folds into the initial state, so this does
-    /// not necessarily start at [`Version::default`].
+    /// not necessarily start at [`Version::default`], and an action's position here is not
+    /// necessarily its index: see [`Self::action`].
     pub fn actions(&self) -> impl ExactSizeIterator<Item = &A> {
         self.actions.iter()
     }
@@ -1363,8 +1418,9 @@ impl<A: Action> History<A> {
     }
 
     /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version. Later states are rebuilt as
-    /// if the removed action had never been applied, and every later version moves down by one.
+    /// at version `index` into the state at the following version: the one [`Self::action`]
+    /// returns for the same index. Later states are rebuilt as if the removed action had never
+    /// been applied, and every later version moves down by one.
     ///
     /// Returns an error if the index is out of range, names an action a fold has already
     /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
@@ -1694,8 +1750,9 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     }
 
     /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version. Later states are rebuilt as
-    /// if the removed action had never been applied, and every later version moves down by one.
+    /// at version `index` into the state at the following version: the one [`Self::action`]
+    /// returns for the same index. Later states are rebuilt as if the removed action had never
+    /// been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
     /// action [`Self::forget_actions`] has already folded into the initial state.
@@ -1805,8 +1862,9 @@ impl<A: Action<Context = ()>> History<A> {
     }
 
     /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version. Later states are rebuilt as
-    /// if the removed action had never been applied, and every later version moves down by one.
+    /// at version `index` into the state at the following version: the one [`Self::action`]
+    /// returns for the same index. Later states are rebuilt as if the removed action had never
+    /// been applied, and every later version moves down by one.
     ///
     /// Returns an error if the index is out of range, names an action a fold has already
     /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
@@ -1896,8 +1954,9 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     }
 
     /// Removes and returns the action at `index`, which is the action that transforms the state
-    /// at version `index` into the state at the following version. Later states are rebuilt as
-    /// if the removed action had never been applied, and every later version moves down by one.
+    /// at version `index` into the state at the following version: the one [`Self::action`]
+    /// returns for the same index. Later states are rebuilt as if the removed action had never
+    /// been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
     /// action [`Self::forget_actions`] has already folded into the initial state.
@@ -2236,6 +2295,30 @@ mod tests {
         #[test]
         fn last_version(history: History<TestAction>) {
             prop_assert_eq!(Some(history.last_version()), history.versions().last());
+        }
+
+        /// An action's index is the version it is applied to, wherever the history now starts,
+        /// and it is the index that removes it.
+        #[test]
+        fn action(history: History<TestAction>, beyond in 0usize..4) {
+            let Version(base) = history.initial_version();
+            let Version(last) = history.last_version();
+            prop_assert_eq!(history.versions().len(), history.actions().len() + 1);
+            for (position, (version, action)) in
+                history.versions().zip(history.actions()).enumerate()
+            {
+                prop_assert_eq!(version.index(), base + position);
+                prop_assert_eq!(history.action(version.index()), Some(action));
+                prop_assert_eq!(
+                    history.clone().remove_action(version.index()),
+                    Some(*action)
+                );
+            }
+            prop_assert_eq!(history.action(last + beyond), None);
+            prop_assert_eq!(history.action(usize::MAX), None);
+            for index in base.saturating_sub(beyond + 1)..base {
+                prop_assert_eq!(history.action(index), None);
+            }
         }
 
         /// Folding must not disturb anything about the history it keeps. Every version that

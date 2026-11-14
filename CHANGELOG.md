@@ -12,6 +12,11 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   *O*(log *k*) for *k* actions, where pushing them one at a time clones it *k* times. A failed
   `try_push_actions` adds none of them and returns them all in a `PushActionsError`.
 
+- `History::action`, which returns the action at an index. The indices are the ones the
+  `remove_action` family takes: they count from the first action ever pushed, so after
+  `forget_actions` they are no longer positions in `History::actions`, and looking an action up
+  by position removed a different one.
+
 ### Changed
 
 - **Breaking**: `Action::inverse` is now `Centralizer::inverse`, and it is a required method.
@@ -40,6 +45,10 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 
 ### Fixed
 
+- The documentation of `Version`, which said that a version is the index that removes the
+  action that produced it. It is the index of the action applied *to* it; the action that
+  produced it is one earlier. It also now says that pops and removals reuse and shift version
+  numbers, where it said that versions count every action ever applied.
 - The documented cost of the `remove_action` family. Removing an action that commutes with the
   actions after it was said to take *O*(log *n*) applications; reconstructing the state the
   action was applied to makes it linear in the distance to the end, and the bound is amortized
