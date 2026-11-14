@@ -834,9 +834,15 @@ impl<A: Action> History<A> {
         // The most recent state must always be cached: `last_state` hands it out directly. It is
         // planned last because it belongs to no window and sits at no version any refill above
         // replays from, so the loop neither sees it nor needs it -- and appending it keeps the
-        // plan ascending.
+        // plan ascending. It does need the loop, though: the finest window the loop refilled sits
+        // one action short of it, so replaying from the newest *kept* state instead would apply
+        // every action in between a second time.
         if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
-            let (Version(from), state) = states.last().expect(HAS_INITIAL_STATE);
+            let kept = states.last().expect(HAS_INITIAL_STATE);
+            let (Version(from), state) = match plan.last() {
+                Some(planned) if planned.0 > kept.0 => planned,
+                _ => kept,
+            };
             let state = replay(*from, new_len, state.clone(), context)?;
             plan.push((Version(new_len), state));
         }
@@ -1803,7 +1809,8 @@ mod tests {
         }
 
         /// Popping in bulk skips the cache states `k` successive pops compute and then discard, so
-        /// it can only ever fall behind by the handful of windows it refills that they did not.
+        /// it never applies more actions than they do. This is exact rather than approximate:
+        /// with any allowance at all it also passes when the bulk pop replays a stretch twice.
         #[test]
         fn pop_actions_costs_no_more_than_repeated_pops(n in 0usize..600, k in 0usize..600) {
             let mut applications = 0;
@@ -1822,10 +1829,9 @@ mod tests {
                 singly.pop_action_with(&mut applications);
             }
 
-            let allowance = History::<CountedAction>::window_count(n) as usize;
             prop_assert!(
-                bulk <= applications + allowance,
-                "bulk {bulk} exceeds {applications} one at a time by more than {allowance}",
+                bulk <= applications,
+                "bulk {bulk} exceeds {applications} one at a time",
             );
             history.assert_cache_invariant();
         }
@@ -2119,8 +2125,73 @@ mod tests {
         }
     }
 
-    /// A bulk pop rebuilds only the cache the shortened history ends up with, so unlike a run of
-    /// single pops its cost does not grow with `k`.
+    /// An action that tallies its applications by identity in the context, so that tests can
+    /// tell *which* actions an operation replayed and how often, not merely how many.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Tallied(usize);
+
+    impl Action for Tallied {
+        type State = ();
+        type Context = Vec<u32>;
+        type Error = Infallible;
+        type Centralizer<'a> = NonCommutative;
+
+        fn apply(&self, _: (), tally: &mut Vec<u32>) -> Result<(), Infallible> {
+            tally[self.0] += 1;
+            Ok(())
+        }
+    }
+
+    /// No operation may apply an action twice to rebuild the cache: each state it needs is
+    /// replayed from the nearest one it already has, including the ones it has only just
+    /// planned. A removal with nothing commuting is the plainest case, since every action after
+    /// the removed one has to be applied again exactly once.
+    #[test]
+    fn rebuilding_the_cache_applies_no_action_twice() {
+        let sizes = (1usize..=64).chain([100, 257, 1000]);
+        for n in sizes {
+            let mut tally = vec![0; n];
+            let mut pushed = History::<Tallied>::default();
+            for i in 0..n {
+                pushed.push_action_with(Tallied(i), &mut tally);
+            }
+            let stride = n.div_ceil(64);
+
+            for index in (0..n).step_by(stride) {
+                let mut history = pushed.clone();
+                tally.fill(0);
+                assert_eq!(
+                    history.remove_action_with(index, &mut tally),
+                    Some(Tallied(index))
+                );
+                assert_eq!(
+                    tally[index], 0,
+                    "the removed action {index} of {n} was applied"
+                );
+                assert!(
+                    tally[..index].iter().all(|&count| count <= 1),
+                    "removing {index} of {n} applied an earlier action twice: {tally:?}"
+                );
+                assert!(
+                    tally[index + 1..].iter().all(|&count| count == 1),
+                    "removing {index} of {n} did not apply each later action once: {tally:?}"
+                );
+            }
+
+            for k in (0..=n).step_by(stride) {
+                let mut history = pushed.clone();
+                tally.fill(0);
+                history.pop_actions_with(k, &mut tally);
+                assert!(
+                    tally.iter().all(|&count| count <= 1),
+                    "popping {k} of {n} applied an action twice: {tally:?}"
+                );
+            }
+        }
+    }
+
+    /// A bulk pop rebuilds only the cache the shortened history ends up with, so its cost grows
+    /// more slowly with `k` than that of a run of single pops.
     #[test]
     fn pop_actions_scales_better_than_repeated_pops() {
         for n in [64usize, 256, 1024, 4096] {
