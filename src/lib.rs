@@ -730,7 +730,21 @@ impl<A: Action> History<A> {
     // The cache holds states at geometrically spaced versions, dense near the most recent version
     // and sparse near the oldest. Rather than pinning each state to an exact version, it groups
     // them into *windows*: window `scale` covers the versions whose distance from the most recent
-    // one lies in `2^scale..2^(scale + 1)`. Every window holds one or two states.
+    // one lies in `2^scale..2^(scale + 1)`. No window ever holds more than two states, which is
+    // what keeps the cache *O*(log *n*).
+    //
+    // Whatever shortens or reorders the history -- a pop, a bulk pop, a removal -- leaves every
+    // window holding at least one state as well, rebuilding the ones that have run empty. A push
+    // rebuilds nothing, so pushes can leave a window empty: the furthest state of a window moves
+    // on into the next while the state behind it is still more than a window's width away. What
+    // survives every operation is the weaker spacing that the bounds actually rest on: each
+    // cached state is less than four times as far from the end as the next nearer one. Stated
+    // exactly, cached states at consecutive distances `a < b` satisfy `b < 4 * (a + 1)`, so
+    // reconstructing a state `k` back replays fewer than `3 * k` actions and folding down to the
+    // most recent `m` actions leaves fewer than `4 * m`. It holds after a rebuild because every
+    // window is then occupied, a push preserves it because it moves both states of a pair one
+    // step further out, and dropping a state from a window that holds three preserves it because
+    // the two it leaves share the window.
     //
     // Windows are measured backwards from the most recent version and counted off the number of
     // actions the history still holds, never off the version numbers themselves. That is what
@@ -817,7 +831,9 @@ impl<A: Action> History<A> {
         for scale in (0..Self::window_count(new_len - initial)).rev() {
             let occupies =
                 |(Version(version), _): &(Version, A::State)| (new_len - *version) >> scale == 1;
-            if states.iter().any(occupies) || plan.iter().any(occupies) {
+            // Only the states already cached can occupy a window: a planned state sits in the
+            // middle of a coarser one.
+            if states.iter().any(occupies) {
                 continue;
             }
             let target = new_len - ((3 << scale) >> 1);
@@ -888,8 +904,10 @@ impl<A: Action> History<A> {
         let new_version = self.last_version();
         self.states.push((new_version, new_state));
 
-        // The state that was most recent lands in the finest window, so a push never leaves a
-        // window empty and never has to replay anything; it only drops states a window can spare.
+        // A push never replays anything: the state that was most recent lands in the finest
+        // window, and all that is left to do is drop the states a window can spare. That can
+        // leave a coarser window empty, which the next operation that shortens the history
+        // repairs; the note on the cache above says why no bound depends on it.
         self.prune_cache();
         Ok(new_version)
     }
@@ -990,6 +1008,15 @@ impl<A: Action> History<A> {
     ) -> Result<Popped<A>, PopError<A>> {
         let base = self.base();
         debug_assert!(base <= new_len && new_len <= self.last_version().0);
+        // Removing nothing must do nothing. Without this a call that pops no action would still
+        // rebuild whichever windows pushes have left empty, applying actions -- and so possibly
+        // failing -- on behalf of an operation that had nothing to do.
+        if new_len == self.last_version().0 {
+            return Ok(Popped {
+                actions: Vec::new(),
+                state: None,
+            });
+        }
         // Keep every cached state the shorter history can still use and rebuild only the windows
         // that running the end backwards leaves empty. When several actions go at once, that
         // skips the states the same number of successive pops would compute and then discard.
@@ -1004,15 +1031,13 @@ impl<A: Action> History<A> {
         )
         .map_err(PopError)?;
 
-        // All mutation happens below and is infallible. The most recent state is always cached,
-        // so if anything is coming off at all it is sitting at the end of the cache.
-        let state = if keep < self.states.len() {
-            let (version, state) = self.states.pop().expect("`keep` is a smaller index");
+        // All mutation happens below and is infallible. The most recent state is always cached
+        // and something is coming off, so it is sitting at the end of the cache.
+        debug_assert!(keep < self.states.len());
+        let state = self.states.pop().map(|(version, state)| {
             debug_assert_eq!(version, self.last_version());
-            Some(state)
-        } else {
-            None
-        };
+            state
+        });
         let actions = self.actions.drain(new_len - base..).rev().collect();
         self.install_refill(keep, plan);
         Ok(Popped { actions, state })
@@ -1085,14 +1110,11 @@ impl<A: Action> History<A> {
         self.states.drain(..index);
         let actions = self.actions.drain(..new_base - base).collect();
 
-        // Windows are measured from the most recent version, which a fold does not move, so every
-        // window the fold does not reach keeps exactly the states it had. The window at scale `t`
-        // covers versions after `last - 2^(t + 1)`, and for every window but the coarsest of the
-        // shortened history `2^(t + 1)` is at most the number of actions left, so none of them
-        // can lose a state, let alone run empty. The new coarsest window is the only one that
-        // changes: the new initial state lands in it, joining the one or two already there, and
-        // pruning is the whole repair.
-        self.prune_cache();
+        // That is the whole repair. Windows are measured from the most recent version, which a
+        // fold does not move, so every cached state that survives is exactly as far from the end
+        // as it was and sits in the window it sat in. The states the fold dropped were the
+        // furthest ones, so no surviving state has lost the nearer neighbour its spacing is
+        // measured against, and no window has gained a state to prune.
         actions
     }
 
@@ -1293,30 +1315,72 @@ impl<A: Action> History<A> {
     }
 
     /// Panics unless the cache is in the shape every operation must leave it in: non-empty,
-    /// strictly ascending, holding the most recent state, and one or two states per window. The
-    /// upper bound is what keeps the cache *O*(log *n*); the lower bound is what keeps
-    /// [`Self::try_get_state_with`] linear in the distance back to the requested version.
+    /// strictly ascending, holding the most recent state and the one before it, at most two
+    /// states per window, and each state less than four times as far from the end as the next
+    /// nearer one (distances `a < b` of consecutive states satisfy `b < 4 * (a + 1)`). The bound
+    /// on each window is what keeps the cache *O*(log *n*); the spacing is what keeps
+    /// [`Self::try_get_state_with`] linear in the distance back to the requested version and
+    /// bounds what [`Self::forget_actions`] leaves behind.
     ///
     /// That the *initial* state is cached needs no assertion: the oldest cached state is what
     /// defines it.
     #[cfg(test)]
     pub(crate) fn assert_cache_invariant(&self) {
         let last = self.last_version();
-        assert!(!self.states.is_empty());
-        assert_eq!(self.states.last().map(|(v, _)| *v), Some(last));
-        assert!(self.states.windows(2).all(|pair| pair[0].0 < pair[1].0));
-        for scale in 0..Self::window_count(last.0 - self.base()) {
-            let occupancy = self
-                .states
-                .iter()
-                .filter(|(version, _)| Self::window_of(last, *version) == Some(scale))
-                .count();
+        let cached = self.cached_versions();
+        assert!(!cached.is_empty());
+        assert_eq!(cached.last(), Some(&last));
+        assert!(cached.windows(2).all(|pair| pair[0] < pair[1]));
+        if !self.actions.is_empty() {
             assert!(
-                (1..=2).contains(&occupancy),
-                "window {scale} holds {occupancy} states at {last:?}: {:?}",
+                cached.contains(&Version(last.0 - 1)),
+                "the state before {last:?} is not cached: {cached:?}"
+            );
+        }
+        for pair in cached.windows(2) {
+            let (far, near) = (last.0 - pair[0].0, last.0 - pair[1].0);
+            assert!(
+                far < 4 * (near + 1),
+                "{:?} is too far behind {:?} at {last:?}: {cached:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for (scale, occupancy) in self.window_occupancy().into_iter().enumerate() {
+            assert!(
+                occupancy <= 2,
+                "window {scale} holds {occupancy} states at {last:?}: {cached:?}"
+            );
+        }
+    }
+
+    /// Panics unless every window holds a state, on top of [`Self::assert_cache_invariant`].
+    /// This is the shape every operation that rebuilds the cache leaves it in -- a pop, a bulk
+    /// pop, a removal -- but not one a push preserves.
+    #[cfg(test)]
+    pub(crate) fn assert_every_window_occupied(&self) {
+        self.assert_cache_invariant();
+        for (scale, occupancy) in self.window_occupancy().into_iter().enumerate() {
+            assert!(
+                occupancy >= 1,
+                "window {scale} is empty at {:?}: {:?}",
+                self.last_version(),
                 self.cached_versions()
             );
         }
+    }
+
+    /// Returns how many cached states each window holds, finest window first.
+    #[cfg(test)]
+    pub(crate) fn window_occupancy(&self) -> Vec<usize> {
+        let last = self.last_version();
+        let mut occupancy = vec![0; Self::window_count(self.actions.len()) as usize];
+        for (version, _) in &self.states {
+            if let Some(scale) = Self::window_of(last, *version) {
+                occupancy[scale as usize] += 1;
+            }
+        }
+        occupancy
     }
 }
 
@@ -1326,9 +1390,9 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
     ///
     #[doc = push_complexity!()]
     pub fn push_action_with(&mut self, action: A, context: &mut A::Context) -> Version {
-        // The state a push displaces from the end always stays cached — it is what lets the next
-        // pop replay nothing — so, unlike a layout that evicts it, there is no clone to avoid
-        // here and nothing to gain over the fallible implementation.
+        // The state a push displaces from the end always stays cached — it is the one the pop
+        // that undoes the push hands back — so, unlike a layout that evicts it, there is no clone
+        // to avoid here and nothing to gain over the fallible implementation.
         self.try_push_action_with(action, context)
             .unwrap_or_else(|error| match error.into_error() {})
     }
@@ -1676,34 +1740,66 @@ mod tests {
         }
     }
 
+    /// One operation on a history. The ones that take a count or an index take it as a fraction
+    /// of what the history holds at the time, so that they stay meaningful however long it has
+    /// grown, and are weighted well below the others so that histories still reach interesting
+    /// lengths.
     #[derive(Arbitrary, Clone, Debug)]
     enum Step<A> {
-        #[proptest(weight = 8)]
+        #[proptest(weight = 12)]
         Push(A),
-        #[proptest(weight = 4)]
+        #[proptest(weight = 6)]
         Pop,
-        /// Weighted well below the others so that histories still reach interesting lengths, and
-        /// asking for few actions so that the fold usually stops at a cached state part of the
-        /// way along rather than swallowing everything.
         #[proptest(weight = 1)]
-        Forget(#[proptest(strategy = "0usize..16")] usize),
+        PopActions(prop::sample::Index),
+        #[proptest(weight = 2)]
+        Remove(prop::sample::Index),
+        #[proptest(weight = 1)]
+        Forget(prop::sample::Index),
+    }
+
+    impl<A: Action<Context = ()>> Step<A> {
+        /// Performs this step, ignoring whether it succeeds: every operation leaves the history
+        /// as it was when it fails.
+        fn run(self, history: &mut History<A>) {
+            let len = history.actions().len();
+            match self {
+                Step::Push(action) => {
+                    let _ = history.try_push_action(action);
+                }
+                Step::Pop => {
+                    let _ = history.try_pop_action();
+                }
+                Step::PopActions(k) => {
+                    let _ = history.try_pop_actions(k.index(len + 1));
+                }
+                Step::Remove(index) => {
+                    if len > 0 {
+                        let index = history.initial_version().index() + index.index(len);
+                        let _ = history.try_remove_action(index);
+                    }
+                }
+                Step::Forget(k) => {
+                    history.forget_actions(k.index(len + 1));
+                }
+            }
+        }
     }
 
     prop_compose! {
-        fn history_strategy()(steps: Vec<Step<TestAction>>) -> History<TestAction> {
+        /// A history that has been through an arbitrary run of operations. Some start from a
+        /// run of pushes, because the steps alone rarely leave more than a handful of actions
+        /// and the coarser windows of the cache only exist in a longer history.
+        fn history_strategy()(
+            prefill in prop::collection::vec(any::<TestAction>(), 0..150),
+            steps: Vec<Step<TestAction>>,
+        ) -> History<TestAction> {
             let mut history = History::default();
+            for action in prefill {
+                history.push_action(action);
+            }
             for step in steps {
-                match step {
-                    Step::Push(action) => {
-                        history.push_action(action);
-                    }
-                    Step::Pop => {
-                        history.pop_action();
-                    }
-                    Step::Forget(k) => {
-                        history.forget_actions(k);
-                    }
-                }
+                step.run(&mut history);
             }
             history
         }
@@ -1760,27 +1856,42 @@ mod tests {
 
             // The two agree on everything observable. The cached versions need not match: the
             // layout depends on how the history got to its length, not only on the length.
-            prop_assert_eq!(popped, expected);
+            prop_assert_eq!(&popped, &expected);
             prop_assert_eq!(history.last_version(), singly.last_version());
             for version in history.versions() {
                 prop_assert_eq!(history.get_state(version), singly.get_state(version));
             }
-            history.assert_cache_invariant();
-            singly.assert_cache_invariant();
+            if popped.is_empty() {
+                history.assert_cache_invariant();
+                singly.assert_cache_invariant();
+            } else {
+                history.assert_every_window_occupied();
+                singly.assert_every_window_occupied();
+            }
         }
 
-        /// Every operation must leave the cache in shape, whatever order they come in.
+        /// Every operation must leave the cache in shape, whatever order they come in, and the
+        /// ones that rebuild it must leave no window empty.
         #[test]
-        fn cache_invariant_under_interleaving(steps: Vec<Step<TestAction>>) {
+        fn cache_invariant_under_interleaving(
+            prefill in 0usize..300,
+            steps: Vec<Step<TestAction>>,
+        ) {
             let mut history = History::<TestAction>::default();
             history.assert_cache_invariant();
-            for step in steps {
-                match step {
-                    Step::Push(action) => { history.push_action(action); }
-                    Step::Pop => { history.pop_action(); }
-                    Step::Forget(k) => { history.forget_actions(k); }
-                }
+            for i in 0..prefill {
+                history.push_action(TestAction((i % 256) as u8));
                 history.assert_cache_invariant();
+            }
+            for step in steps {
+                let before = history.actions().len();
+                let rebuilds = matches!(step, Step::Pop | Step::PopActions(_) | Step::Remove(_));
+                step.run(&mut history);
+                if rebuilds && history.actions().len() < before {
+                    history.assert_every_window_occupied();
+                } else {
+                    history.assert_cache_invariant();
+                }
             }
         }
 
@@ -2069,17 +2180,7 @@ mod tests {
         fn fallible_history_strategy()(steps: Vec<Step<Option<TestAction>>>) -> History<Option<TestAction>> {
             let mut history = History::default();
             for step in steps {
-                match step {
-                    Step::Push(action) => {
-                        let _ = history.try_push_action(action);
-                    }
-                    Step::Pop => {
-                        let _ = history.try_pop_action();
-                    }
-                    Step::Forget(k) => {
-                        history.forget_actions(k);
-                    }
-                }
+                step.run(&mut history);
             }
             history
         }
@@ -2187,6 +2288,86 @@ mod tests {
                     "popping {k} of {n} applied an action twice: {tally:?}"
                 );
             }
+        }
+    }
+
+    /// Builds a history by pushing `n` counted actions.
+    fn counted_history(n: usize) -> History<CountedAction> {
+        let mut history = History::default();
+        for i in 0..n {
+            history.push_action_with(CountedAction((i % 256) as u8), &mut 0);
+        }
+        history
+    }
+
+    /// Panics unless every version of `history` holds the state its actions produce.
+    fn assert_states_match_actions(history: &History<CountedAction>) {
+        let mut state = history.initial_state().clone();
+        let mut versions = history.versions();
+        assert_eq!(
+            history.get_state_with(versions.next().unwrap(), &mut 0),
+            Some(state.clone())
+        );
+        for (version, action) in versions.zip(history.actions()) {
+            state.push(*action);
+            assert_eq!(
+                history.get_state_with(version, &mut 0).as_ref(),
+                Some(&state)
+            );
+        }
+        assert_eq!(*history.last_state(), state);
+    }
+
+    /// A push rebuilds nothing, so one that follows a bulk pop or a removal can carry the only
+    /// state of a window out of it while the state behind is still too far back to follow. The
+    /// cache must stay within its spacing all the same, every state must stay right, and the
+    /// next operation that shortens the history must close the gap. These are the shortest
+    /// sequences that open one.
+    #[test]
+    fn a_push_can_leave_a_window_empty() {
+        type Sequence = fn(&mut History<CountedAction>);
+        let sequences: [Sequence; 3] = [
+            |history| {
+                assert!(history.remove_action_with(0, &mut 0).is_some());
+            },
+            |history| {
+                assert!(history.remove_action_with(0, &mut 0).is_some());
+                assert_eq!(history.pop_actions_with(4, &mut 0).len(), 4);
+            },
+            |history| {
+                assert_eq!(history.pop_actions_with(9, &mut 0).len(), 9);
+                for _ in 0..8 {
+                    history.push_action_with(CountedAction(0), &mut 0);
+                }
+                assert_eq!(history.pop_actions_with(6, &mut 0).len(), 6);
+            },
+        ];
+        for (sequence, n) in sequences.into_iter().zip([16, 12, 14]) {
+            let mut history = counted_history(n);
+            sequence(&mut history);
+            history.assert_every_window_occupied();
+
+            history.push_action_with(CountedAction(1), &mut 0);
+            assert!(
+                history.window_occupancy().contains(&0),
+                "the push after {n} left no window empty: {:?}",
+                history.cached_versions()
+            );
+            history.assert_cache_invariant();
+            assert_states_match_actions(&history);
+
+            // Popping nothing is not an occasion to repair it: it must apply nothing and
+            // change nothing.
+            let cached = history.cached_versions();
+            let mut applications = 0;
+            assert!(history.pop_actions_with(0, &mut applications).is_empty());
+            assert_eq!(applications, 0);
+            assert_eq!(history.cached_versions(), cached);
+
+            // Popping something is.
+            assert!(history.pop_action_with(&mut 0).is_some());
+            history.assert_every_window_occupied();
+            assert_states_match_actions(&history);
         }
     }
 
