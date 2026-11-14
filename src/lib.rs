@@ -222,8 +222,8 @@ impl<'a, A: Action> Centralizer<'a, A> for NonCommutative {
 }
 
 // These error types are written out rather than derived because every derive would bound the
-// action type itself, which none of them stores except `PushError`. Deriving `Debug` on
-// `PopError<A>` would make `history.try_pop_action().unwrap()` require `A: Debug`.
+// action type itself, which none of them stores except `PushError` and `PushActionsError`. Deriving
+// `Debug` on `PopError<A>` would make `history.try_pop_action().unwrap()` require `A: Debug`.
 
 /// The error type of [`History::try_push_action`] and [`History::try_push_action_with`].
 ///
@@ -288,6 +288,75 @@ where
 impl<A: Action + Eq> Eq for PushError<A> where A::Error: Eq {}
 
 impl<A: Action + std::fmt::Debug> std::error::Error for PushError<A> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// The error type of [`History::try_push_actions`] and [`History::try_push_actions_with`].
+///
+/// A failed push adds none of the actions to the history, so the error carries them all back to
+/// the caller, in the order they were given. It does not say which of them failed: they are
+/// applied through [`Action::apply_batch`], which does not say either.
+pub struct PushActionsError<A: Action> {
+    actions: Vec<A>,
+    error: A::Error,
+}
+
+impl<A: Action> PushActionsError<A> {
+    /// Returns the actions that were not pushed.
+    pub fn actions(&self) -> &[A] {
+        &self.actions
+    }
+
+    /// Returns the error that applying one of the actions produced.
+    pub fn error(&self) -> &A::Error {
+        &self.error
+    }
+
+    /// Returns the actions that were not pushed, consuming the error.
+    pub fn into_actions(self) -> Vec<A> {
+        self.actions
+    }
+
+    /// Returns the error that applying one of the actions produced, consuming the rest.
+    pub fn into_error(self) -> A::Error {
+        self.error
+    }
+
+    /// Splits into the actions that were not pushed and the error one of them produced.
+    pub fn into_parts(self) -> (Vec<A>, A::Error) {
+        (self.actions, self.error)
+    }
+}
+
+impl<A: Action> std::fmt::Display for PushActionsError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("failed to apply action")
+    }
+}
+
+impl<A: Action + std::fmt::Debug> std::fmt::Debug for PushActionsError<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushActionsError")
+            .field("actions", &self.actions)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<A: Action + PartialEq> PartialEq for PushActionsError<A>
+where
+    A::Error: PartialEq,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.actions == other.actions && self.error == other.error
+    }
+}
+
+impl<A: Action + Eq> Eq for PushActionsError<A> where A::Error: Eq {}
+
+impl<A: Action + std::fmt::Debug> std::error::Error for PushActionsError<A> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
@@ -523,6 +592,40 @@ assert_eq!(history.last_version(), version);
     };
 }
 
+// The `# Example` section for the `push_actions` family. `call` must push `Add(40)` and then
+// `Add(2)` and evaluate to the new version.
+macro_rules! push_actions_example {
+    ($setup:expr, $call:expr) => {
+        concat!(
+            "# Example
+
+```
+# use history::*;
+# #[derive(Debug, PartialEq, Eq)]
+# struct Add(i32);
+# impl Action for Add {
+#  type State = i32;
+#  type Context = ();
+#  type Error = std::convert::Infallible;
+#  type Centralizer<'a> = NonCommutative;
+#  fn apply(&self, state: i32, _: &mut ()) -> Result<i32, Self::Error> { Ok(self.0 + state) }
+# }
+# let mut history = History::default();
+",
+            $setup,
+            "let version = ",
+            $call,
+            ";
+assert_eq!(*history.last_state(), 42);
+assert_eq!(history.last_version(), version);
+// Each action is still a version of its own.
+assert_eq!(history.pop_action(), Some(Add(2)));
+assert_eq!(*history.last_state(), 40);
+```"
+        )
+    };
+}
+
 // The `# Example` section for the `pop_action` family. `call` must evaluate to an `Option`
 // holding `popped`.
 macro_rules! pop_example {
@@ -652,6 +755,16 @@ macro_rules! push_complexity {
         "# Time complexity
 
 Performs exactly one application and one state clone, plus *O*(log *n*) bookkeeping."
+    };
+}
+
+macro_rules! push_actions_complexity {
+    () => {
+        "# Time complexity
+
+Performs exactly one application for each action pushed and *O*(log *k*) state clones, where *k*
+is how many there are, plus *O*(log *n*) bookkeeping. Pushing them one at a time clones the state
+*k* times, to cache states that all but *O*(log *k*) of the later pushes then drop."
     };
 }
 
@@ -920,7 +1033,9 @@ impl<A: Action> History<A> {
 
     // Returns the states that must be added to `states` for it to cache a history whose most
     // recent version is `new_len`, ascending by version. `replay` must carry a state from one
-    // version of the *new* history to a later one.
+    // version of the *new* history to a later one. The first of `states` is taken to be the
+    // initial state, so passing only the most recent state plans the cache for the actions after
+    // it alone.
     //
     // Every action application a cache repair needs happens here, so a caller can run this before
     // touching the history and leave it untouched if an application fails.
@@ -992,6 +1107,53 @@ impl<A: Action> History<A> {
         // repairs; the note on the cache above says why no bound depends on it.
         self.prune_cache();
         Ok(new_version)
+    }
+
+    /// Adds new actions to the end of the history, in order, and returns the new most recent
+    /// version. Each action is a version of its own, exactly as if they had been pushed one at a
+    /// time.
+    ///
+    /// Returns an error carrying all of the actions back if applying one of them fails; in that
+    /// case, the history is unchanged.
+    #[doc = push_actions_example!(
+        context_setup!(),
+        "history.try_push_actions_with([Add(40), Add(2)], &mut context).unwrap()"
+    )]
+    ///
+    #[doc = push_actions_complexity!()]
+    pub fn try_push_actions_with(
+        &mut self,
+        actions: impl IntoIterator<Item = A>,
+        context: &mut A::Context,
+    ) -> Result<Version, PushActionsError<A>> {
+        let actions = Vec::from_iter(actions);
+        let Version(old_len) = self.last_version();
+        let new_len = old_len + actions.len();
+
+        // The new actions are a history of their own that starts at the most recent state, and
+        // the states to cache for them are the ones that history would cache for itself. Seen
+        // from the new end, the states already cached all lie beyond that one: they are still
+        // the right way apart, since each has moved further out by the same amount, and all
+        // they can need is pruning. Planning before touching anything is what leaves the history
+        // unchanged if an application fails.
+        let newest = &self.states[self.states.len() - 1..];
+        let plan = Self::plan_refill(
+            newest,
+            new_len,
+            |from, to, state, context| {
+                A::apply_batch(&actions[from - old_len..to - old_len], state, context)
+            },
+            context,
+        );
+        match plan {
+            Ok(plan) => {
+                self.actions.extend(actions);
+                self.states.extend(plan);
+                self.prune_cache();
+                Ok(Version(new_len))
+            }
+            Err(error) => Err(PushActionsError { actions, error }),
+        }
     }
 
     /// Removes and returns the most recent action and the state it produced.
@@ -1460,6 +1622,24 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
             .unwrap_or_else(|error| match error.into_error() {})
     }
 
+    /// Adds new actions to the end of the history, in order, and returns the new most recent
+    /// version. Each action is a version of its own, exactly as if they had been pushed one at a
+    /// time.
+    #[doc = push_actions_example!(
+        context_setup!(),
+        "history.push_actions_with([Add(40), Add(2)], &mut context)"
+    )]
+    ///
+    #[doc = push_actions_complexity!()]
+    pub fn push_actions_with(
+        &mut self,
+        actions: impl IntoIterator<Item = A>,
+        context: &mut A::Context,
+    ) -> Version {
+        self.try_push_actions_with(actions, context)
+            .unwrap_or_else(|error| match error.into_error() {})
+    }
+
     /// Removes and returns the most recent action and the state it produced.
     ///
     /// Returns `None` if there are no actions.
@@ -1561,6 +1741,25 @@ impl<A: Action<Context = ()>> History<A> {
         self.try_push_action_with(action, &mut ())
     }
 
+    /// Adds new actions to the end of the history, in order, and returns the new most recent
+    /// version. Each action is a version of its own, exactly as if they had been pushed one at a
+    /// time.
+    ///
+    /// Returns an error carrying all of the actions back if applying one of them fails; in that
+    /// case, the history is unchanged.
+    #[doc = push_actions_example!(
+        "",
+        "history.try_push_actions([Add(40), Add(2)]).unwrap()"
+    )]
+    ///
+    #[doc = push_actions_complexity!()]
+    pub fn try_push_actions(
+        &mut self,
+        actions: impl IntoIterator<Item = A>,
+    ) -> Result<Version, PushActionsError<A>> {
+        self.try_push_actions_with(actions, &mut ())
+    }
+
     /// Removes and returns the most recent action and the state it produced.
     ///
     /// Returns `None` if there are no actions or an error if applying an action fails. In either
@@ -1643,6 +1842,18 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
         self.push_action_with(action, &mut ())
     }
 
+    /// Adds new actions to the end of the history, in order, and returns the new most recent
+    /// version. Each action is a version of its own, exactly as if they had been pushed one at a
+    /// time.
+    ///
+    /// This is also what [`Extend`] does.
+    #[doc = push_actions_example!("", "history.push_actions([Add(40), Add(2)])")]
+    ///
+    #[doc = push_actions_complexity!()]
+    pub fn push_actions(&mut self, actions: impl IntoIterator<Item = A>) -> Version {
+        self.push_actions_with(actions, &mut ())
+    }
+
     /// Removes and returns the most recent action and the state it produced.
     ///
     /// Returns `None` if there are no actions.
@@ -1711,6 +1922,13 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
     /// Takes *O*(*k* + log *n*) time, where *k* is how far back `version` is.
     pub fn get_state(&self, version: Version) -> Option<A::State> {
         self.get_state_with(version, &mut ())
+    }
+}
+
+/// Pushes the actions as [`History::push_actions`] does.
+impl<A: Action<Context = (), Error = std::convert::Infallible>> Extend<A> for History<A> {
+    fn extend<I: IntoIterator<Item = A>>(&mut self, actions: I) {
+        self.push_actions(actions);
     }
 }
 
@@ -1811,6 +2029,8 @@ mod tests {
     enum Step<A> {
         #[proptest(weight = 12)]
         Push(A),
+        #[proptest(weight = 2)]
+        PushActions(Vec<A>),
         #[proptest(weight = 6)]
         Pop,
         #[proptest(weight = 1)]
@@ -1829,6 +2049,9 @@ mod tests {
             match self {
                 Step::Push(action) => {
                     let _ = history.try_push_action(action);
+                }
+                Step::PushActions(actions) => {
+                    let _ = history.try_push_actions(actions);
                 }
                 Step::Pop => {
                     let _ = history.try_pop_action();
@@ -2675,6 +2898,108 @@ mod tests {
                     tally.iter().all(|&count| count <= 1),
                     "popping {k} of {n} applied an action twice: {tally:?}"
                 );
+            }
+        }
+    }
+
+    proptest! {
+        /// Pushing actions in bulk must leave exactly the history that pushing them one at a
+        /// time does, apart from which states it has cached.
+        #[test]
+        fn push_actions(
+            history: History<TestAction>,
+            actions in prop::collection::vec(any::<TestAction>(), 0..200),
+        ) {
+            let mut singly = history.clone();
+            let mut extended = history.clone();
+            let mut history = history;
+
+            let version = history.push_actions(actions.clone());
+            extended.extend(actions.clone());
+            for action in actions {
+                singly.push_action(action);
+            }
+
+            prop_assert_eq!(version, singly.last_version());
+            prop_assert_eq!(history.last_version(), singly.last_version());
+            prop_assert_eq!(&history.actions, &singly.actions);
+            for version in history.versions() {
+                prop_assert_eq!(history.get_state(version), singly.get_state(version));
+            }
+            history.assert_cache_invariant();
+
+            prop_assert_eq!(&extended.actions, &history.actions);
+            prop_assert_eq!(&extended.states, &history.states);
+        }
+    }
+
+    /// A bulk push applies each action it adds exactly once and nothing else, and clones only
+    /// the states it will keep: one for each window of a history as long as the push. For a
+    /// single action that is the one application and one clone of a plain push.
+    #[test]
+    fn push_actions_applies_each_action_once() {
+        for n in [0usize, 1, 5, 64, 100] {
+            for k in (0usize..=40).chain([64, 100, 1000]) {
+                let mut tally = vec![0; n + k];
+                let mut history = tallied_history::<false>(n);
+                let version = history.push_actions_with((n..n + k).map(Tallied), &mut tally);
+                assert_eq!(version, Version(n + k));
+                assert!(
+                    tally[..n].iter().all(|&count| count == 0),
+                    "pushing {k} onto {n} applied an action already there: {tally:?}"
+                );
+                assert!(
+                    tally[n..].iter().all(|&count| count == 1),
+                    "pushing {k} onto {n} did not apply each action once: {tally:?}"
+                );
+                history.assert_cache_invariant();
+
+                let mut history = mixed_history::<false>((0..n).map(|i| i % SLOT_COUNT));
+                let actions = (0..k).map(|i| Mix {
+                    slot: i % SLOT_COUNT,
+                    value: (i % 251) as u8,
+                });
+                let mut meter = Meter::unlimited();
+                CLONES.set(0);
+                history
+                    .try_push_actions_with(actions, &mut meter)
+                    .expect("the meter is unlimited");
+                assert_eq!(meter.applications, k);
+                assert_eq!(
+                    CLONES.get(),
+                    History::<Mix<false>>::window_count(k) as usize,
+                    "pushing {k} onto {n}"
+                );
+                assert_cached_states_match_actions(&history);
+                history.assert_cache_invariant();
+            }
+        }
+    }
+
+    /// A bulk push that fails must add none of its actions, hand them all back in order, and
+    /// leave the history exactly as it was, whichever of them it is that fails.
+    #[test]
+    fn a_failed_bulk_push_changes_nothing() {
+        for n in [0usize, 1, 7, 33] {
+            let history = mixed_history::<true>((0..n).map(|i| i % SLOT_COUNT));
+            for k in 1usize..=40 {
+                let actions: Vec<_> = (0..k)
+                    .map(|i| Mix {
+                        slot: i % SLOT_COUNT,
+                        value: (i % 251) as u8,
+                    })
+                    .collect();
+                for budget in 0..k {
+                    let mut failed = history.clone();
+                    let error = failed
+                        .try_push_actions_with(actions.clone(), &mut Meter::limited(budget))
+                        .expect_err("the meter runs out before the last action");
+                    assert_eq!(error.actions(), actions);
+                    assert_eq!(*error.error(), Exhausted);
+                    assert_eq!(error.into_parts(), (actions.clone(), Exhausted));
+                    assert_eq!(failed.actions, history.actions);
+                    assert_eq!(failed.states, history.states);
+                }
             }
         }
     }

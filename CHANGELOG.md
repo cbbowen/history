@@ -4,6 +4,14 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 
 ## 0.6.0 (unreleased)
 
+### Added
+
+- `History::push_actions`, with the usual `try_` and `_with` variants, which adds several
+  actions at once, and an `Extend` implementation that does the same. Each action is still a
+  version of its own, but the state is cloned once for each state the push will keep cached,
+  *O*(log *k*) for *k* actions, where pushing them one at a time clones it *k* times. A failed
+  `try_push_actions` adds none of them and returns them all in a `PushActionsError`.
+
 ### Changed
 
 - **Breaking**: `Action::inverse` is now `Centralizer::inverse`, and it is a required method.
