@@ -52,7 +52,7 @@ assert_eq!(*history.last_state(), 710);
 
 The history above is unbounded: it keeps every action forever, and only the *states* are held to *O*(log n). When that is too much, [`History::forget_actions`] folds the oldest actions into the initial state and drops them, which is the only way anything leaves the front.
 
-It applies no action and clones no state. The cached states are spaced geometrically backwards from the most recent version, so folding stops at a state that is already cached and there is nothing to reconstruct — just the actions to drop. In exchange it folds in only as far as such a state, which can be well short of what you asked for, and nothing at all if you ask for little. What is bounded is what it leaves: ask to keep the most recent *m* actions and fewer than 4*m* remain. So decide what to keep rather than what to drop, and call it again as the history grows.
+It may fold in fewer actions than you ask for, and none at all if you ask for only a few. What is bounded is what it leaves: ask to keep the most recent *m* actions and fewer than 4*m* remain. So decide what to keep rather than what to drop, and call it again as the history grows.
 
 ```rust
 # enum MyAction { Add(i32), Sub(i32) }

@@ -33,7 +33,7 @@ macro_rules! default_doc {
 macro_rules! context_doc {
     () => {
         concat!(
-"Anything applying an action needs that the history does not hold, such as an interner or a pool of scratch buffers. Every operation that can apply an action takes one by `&mut`. Actions are applied again whenever a state has to be rebuilt, so whatever applying one does to the context must be safe to repeat: see [`Action::apply`].
+"Anything applying an action needs that the history does not hold, such as an interner or a pool of scratch buffers. Every operation that can apply an action takes one by `&mut`. An action can be applied any number of times, so whatever applying one does to the context must be safe to repeat: see [`Action::apply`].
 
 ",
             default_doc!(
@@ -66,13 +66,13 @@ This crate's error types report a value of this type as their [`source`](std::er
 macro_rules! centralizer_doc {
     () => {
         concat!(
-"Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to. That is what lets the `remove_action_applied_at` family correct the cached states after the action it removes rather than replay the actions that led to them.
+"Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to.
 
 ",
             default_doc!(
                 "[`NonCommutative`]",
-                "when removing an action need not be cheap",
-                "never reports that anything commutes: always sound, and never cheaper"
+                "when in doubt",
+                "never reports that anything commutes and is always sound"
             )
         )
     };
@@ -106,15 +106,11 @@ pub trait Action: Sized {
 
     /// Applies this action to a state, producing a new state.
     ///
-    /// The history keeps only some of its states and rebuilds the rest by applying actions
-    /// again: when a state is read, when actions are popped, and when one is removed. An action
-    /// can therefore be applied any number of times, to a state it has been applied to before
-    /// or, once an earlier action has been removed, to one it has never seen. So the state this
-    /// returns must depend only on the action and the state it is given, not on what the context
-    /// has been through or on how often this has been called, and whatever it does to the
-    /// context must be harmless to repeat. Interning a string qualifies. Drawing a fresh
-    /// identifier for the state from a counter does not: the same version would then hold a
-    /// different state when it is rebuilt than when it was cached.
+    /// An action can be applied any number of times, and not only to the state it was first
+    /// applied to. The state this returns must therefore depend only on the action and the state
+    /// it is given, not on what the context has been through or on how often this has been
+    /// called, and whatever it does to the context must be harmless to repeat. Interning a
+    /// string qualifies. Drawing a fresh identifier for the state from a counter does not.
     ///
     /// An error fails the operation that was applying the action, which leaves the history as
     /// it was.
@@ -126,12 +122,9 @@ pub trait Action: Sized {
 
     /// Applies a sequence of actions to a state in order, producing a new state.
     ///
-    /// Every state the history rebuilds is rebuilt through this, as is every bulk push; only
-    /// pushing a single action calls [`Self::apply`] directly. Override it if a run of actions
-    /// can be applied more cheaply together than one at a time. An override must return exactly
-    /// what applying each action in turn with [`Self::apply`] would, the error included.
-    /// `actions` is never empty, and can be any consecutive run of actions that a history holds
-    /// or is being given.
+    /// Override this if a run of actions can be applied more cheaply together than one at a
+    /// time. An override must return exactly what applying each action in turn with
+    /// [`Self::apply`] would, the error included. `actions` is never empty.
     fn apply_batch(
         actions: &[Self],
         mut state: Self::State,
@@ -179,10 +172,8 @@ impl From<Version> for usize {
 /// Represents the set of actions an action commutes with, and takes that action back out of a
 /// state they have since been applied to.
 ///
-/// This is what lets the `remove_action_applied_at` family correct the cached states that follow
-/// the action it removes rather than replay the actions that led to them. The two halves cannot be
-/// implemented apart, which is why they share a trait: [`Self::commutes`] promises something
-/// about what [`Self::inverse`] does.
+/// The two halves cannot be implemented apart, which is why they share a trait:
+/// [`Self::commutes`] promises something about what [`Self::inverse`] does.
 ///
 /// To be precise, let `c` be `Centralizer::for_action(a)` and let `b_1, ..., b_k` be any actions
 /// with `c.commutes(b_i)` for every `i`. Write `bs(s)` for applying them in order to a state `s`.
@@ -196,11 +187,10 @@ impl From<Version> for usize {
 /// *must* leave `state` equivalent to `bs(s)`. Note that `inverse` is passed the state from
 /// before `a` was applied, not the one immediately preceding `state`; the two differ by exactly
 /// `b_1, ..., b_k`, which is what commuting has to make irrelevant. The single-action case
-/// `k = 1` is not sufficient: the `remove_action_applied_at` family takes an action out from behind
-/// a whole run of commuting actions at once.
+/// `k = 1` is not sufficient: this must hold for a whole run of commuting actions at once.
 ///
-/// False negative results from `commutes` cost only time: the `remove_action_applied_at` family
-/// replays the actions it could have skipped. False positive results will produce incorrect states.
+/// False negative results from `commutes` cost only time. False positive results will produce
+/// incorrect states.
 ///
 /// # Example
 ///
@@ -247,7 +237,7 @@ impl From<Version> for usize {
 /// history.push_action(Set(1, 2));
 /// assert_eq!(*history.last_state(), vec![1, 2]);
 ///
-/// // Taken out from behind `Set(1, 2)`, which is not applied again.
+/// // The later states are as if `Set(0, 1)` had never been applied.
 /// let first = history.initial_version();
 /// assert_eq!(history.remove_action_applied_at(first), Some(Set(0, 1)));
 /// assert_eq!(*history.last_state(), vec![0, 2]);
@@ -270,7 +260,7 @@ pub trait Centralizer<'a, A: Action> {
     /// other actions applied; the trait documentation states this precisely. Restoring from
     /// `previous_state` the part of the state the action affected is the usual way to do it.
     ///
-    /// This is never called for a state that only the action itself has been applied to, so a
+    /// `state` always has at least one such action applied to it after this one, so a
     /// centralizer whose `commutes` never returns `true` is never asked.
     fn inverse(&self, previous_state: &A::State, state: &mut A::State);
 }
@@ -369,8 +359,7 @@ impl<A: Action + std::fmt::Debug> std::error::Error for PushError<A> {
 /// The error type of [`History::try_push_actions`] and [`History::try_push_actions_with`].
 ///
 /// A failed push adds none of the actions to the history, so the error carries them all back to
-/// the caller, in the order they were given. It does not say which of them failed: they are
-/// applied through [`Action::apply_batch`], which does not say either.
+/// the caller, in the order they were given. It does not say which of them failed.
 pub struct PushActionsError<A: Action> {
     actions: Vec<A>,
     error: A::Error,
@@ -444,7 +433,7 @@ pub enum GetStateError<A: Action> {
     /// folded it into the initial state.
     VersionForgotten(Version),
 
-    /// Applying an action failed while reconstructing the state.
+    /// Applying an action failed.
     ActionFailed(A::Error),
 }
 
@@ -508,8 +497,8 @@ pub enum RemoveActionError<A: Action> {
     /// [`History::forget_actions`] having folded it into the initial state.
     VersionForgotten(Version),
 
-    /// Applying an action failed while rebuilding the cached states. The action to remove is
-    /// still in the history, which is exactly as it was.
+    /// Applying an action failed. The action to remove is still in the history, which is
+    /// exactly as it was.
     ActionFailed(A::Error),
 }
 
@@ -814,14 +803,14 @@ macro_rules! remove_example {
             "history.push_action(Set(0, 1));
 history.push_action(Set(1, 2));
 assert_eq!(*history.last_state(), vec![1, 2]);
-// `Set(0, 1)` commutes with `Set(1, 2)`, which is not applied again: see `Centralizer`.
+// The later states are as if `Set(0, 1)` had never been applied.
 assert_eq!(",
             $call,
             ", ",
             $first,
             ");
 assert_eq!(*history.last_state(), vec![0, 2]);
-// Removing an action that does not commute replays the actions after it.
+// Whether the later actions commute with the one removed makes no difference to that.
 history.push_action(Set(1, 4));
 assert_eq!(",
             $call,
@@ -1460,14 +1449,12 @@ impl<A: Action> History<A> {
     /// numbers they always had, so a [`Version`] held across a call still names the state it always
     /// named, or else says it is gone — it never comes to mean a different state.
     ///
-    /// Only as many actions are folded in as can be without replaying any: the fold stops at the
-    /// newest already-cached state at or before the `k`th action, so it may fold in fewer than
-    /// `k`, or none at all when no state is cached in between, which is the usual result of
-    /// asking for only a few. What is bounded is what the fold leaves behind, because the cache
-    /// is geometrically spaced: asking to keep the most recent *m* actions leaves fewer than four
-    /// times that many. So decide what to keep rather than what to drop, and repeating the call
-    /// as the history grows keeps it to a size. Ask for more than the history holds and it folds
-    /// in everything, leaving the most recent state as the initial one.
+    /// It may fold in fewer than `k` actions, or none at all, which is the usual result of
+    /// asking for only a few. What is bounded is what the fold leaves behind: asking to keep the
+    /// most recent *m* actions leaves fewer than four times that many. So decide what to keep
+    /// rather than what to drop, and repeating the call as the history grows keeps it to a size.
+    /// Ask for more than the history holds and it folds in everything, leaving the most recent
+    /// state as the initial one.
     ///
     /// # Example
     ///
@@ -1533,12 +1520,12 @@ impl<A: Action> History<A> {
 
     /// Removes and returns the action applied at `version`, which is the action that transforms
     /// the state at `version` into the state at the following version: the one
-    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
-    /// action had never been applied, and every later version moves down by one.
+    /// [`Self::action_applied_at`] returns for it. Later states become what they would have been
+    /// had the removed action never been applied, and every later version moves down by one.
     ///
     /// Returns an error if no action is applied at `version`, whether because none has been yet
-    /// or because a fold has already swallowed it, or if applying an action fails while
-    /// rebuilding the cached states. In every case, the history is unchanged.
+    /// or because a fold has already swallowed it, or if applying an action fails. In every
+    /// case, the history is unchanged.
     #[doc = remove_example!(
         context_setup!(),
         "history.try_remove_action_applied_at_with(history.initial_version(), &mut context).unwrap()",
@@ -1881,8 +1868,8 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
 
     /// Removes and returns the action applied at `version`, which is the action that transforms
     /// the state at `version` into the state at the following version: the one
-    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
-    /// action had never been applied, and every later version moves down by one.
+    /// [`Self::action_applied_at`] returns for it. Later states become what they would have been
+    /// had the removed action never been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if no action is applied at `version`,
     /// whether because none has been yet or because [`Self::forget_actions`] has already folded
@@ -1999,12 +1986,12 @@ impl<A: Action<Context = ()>> History<A> {
 
     /// Removes and returns the action applied at `version`, which is the action that transforms
     /// the state at `version` into the state at the following version: the one
-    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
-    /// action had never been applied, and every later version moves down by one.
+    /// [`Self::action_applied_at`] returns for it. Later states become what they would have been
+    /// had the removed action never been applied, and every later version moves down by one.
     ///
     /// Returns an error if no action is applied at `version`, whether because none has been yet
-    /// or because a fold has already swallowed it, or if applying an action fails while
-    /// rebuilding the cached states. In every case, the history is unchanged.
+    /// or because a fold has already swallowed it, or if applying an action fails. In every
+    /// case, the history is unchanged.
     #[doc = remove_example!(
         "",
         "history.try_remove_action_applied_at(history.initial_version()).unwrap()",
@@ -2095,8 +2082,8 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
 
     /// Removes and returns the action applied at `version`, which is the action that transforms
     /// the state at `version` into the state at the following version: the one
-    /// [`Self::action_applied_at`] returns for it. Later states are rebuilt as if the removed
-    /// action had never been applied, and every later version moves down by one.
+    /// [`Self::action_applied_at`] returns for it. Later states become what they would have been
+    /// had the removed action never been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if no action is applied at `version`,
     /// whether because none has been yet or because [`Self::forget_actions`] has already folded

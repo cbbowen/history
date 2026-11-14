@@ -8,9 +8,9 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
 
 - `History::push_actions`, with the usual `try_` and `_with` variants, which adds several
   actions at once, and an `Extend` implementation that does the same. Each action is still a
-  version of its own, but the state is cloned once for each state the push will keep cached,
-  *O*(log *k*) for *k* actions, where pushing them one at a time clones it *k* times. A failed
-  `try_push_actions` adds none of them and returns them all in a `PushActionsError`.
+  version of its own, but the state is cloned *O*(log *k*) times for *k* actions, where pushing
+  them one at a time clones it *k* times. A failed `try_push_actions` adds none of them and
+  returns them all in a `PushActionsError`.
 - `History::action_applied_at`, which returns the action applied at a version, and
   `History::versions_and_actions`, which returns every action alongside the version it is
   applied at. That version is how a removal names the action to remove.
@@ -35,29 +35,25 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   which `versions_and_actions` returns with it, and for the oldest action that is
   `initial_version()`. `RemoveActionError::IndexOutOfRange` and `IndexForgotten`, which held the
   index, are `VersionOutOfRange` and `VersionForgotten`, which hold the version.
-- **Breaking**: a failed removal now leaves the history exactly as it was, like
-  every other operation. It used to leave the action moved past some of the actions it commutes
-  with. `RemoveActionError::ActionFailed` is accordingly a tuple variant holding only the error,
-  no longer a struct variant that also carried the action's new index.
-- Removing an action no longer applies an action to correct a cached state. The cached states
-  among the actions it commutes with are corrected with `Centralizer::inverse` alone, where each
-  used to cost an application as well, and the state the action was applied to is only rebuilt
-  when one of them needs it. None of the actions before the last corrected state is applied
-  again, so removing an action that commutes with everything after it applies none of them.
-  Reporting that actions commute now never costs an application over reporting that nothing
-  does; it used to cost more whenever the commuting run ended before the next cached state.
-- `forget_actions` now takes time proportional to the actions it leaves, as documented. It
-  copied every action it folded in to a new vector as well. The vector it returns is now the
-  buffer the history held, so it can have room for more than it contains.
+- **Breaking**: a failed removal now leaves the history exactly as it was, like every other
+  operation. It used to leave the action moved past some of the actions it commutes with.
+  `RemoveActionError::ActionFailed` is accordingly a tuple variant holding only the error, no
+  longer a struct variant that also carried the action's new index.
+- Removing an action applies fewer actions. Removing one that commutes with everything after it
+  applies none of them, and reporting that actions commute never costs an application over
+  reporting that nothing does, which it used to.
 - A removal now relies only on the property `Centralizer` documents. A failure part of the way
-  through used to leave cached states that were right only if the actions also commuted in the
+  through used to leave states that were right only if the actions also commuted in the
   everyday sense, which that property does not imply.
+- `forget_actions` now takes time proportional to the actions it leaves, as documented. It
+  copied every action it folded in to a new vector as well. The vector it returns can have room
+  for more than it contains.
 - **Breaking**: the defaults for `Action::Context`, `Action::Error` and `Action::Centralizer` now
   need the nightly-only `associated_type_defaults` cargo feature. Without it the crate builds on
   stable, and every implementation has to name all three types.
-- The time complexity sections now give asymptotic bounds only, amortized and worst case, with
-  what they count stated once on `History`. They no longer describe how many applications or
-  clones an operation happens to perform, or when the cache makes one cheaper.
+- The documentation no longer describes how the history is implemented. It says what each
+  operation does and what each trait requires, and gives time complexity as asymptotic bounds
+  only, amortized and worst case, with what they count stated once on `History`.
 
 ### Fixed
 
@@ -65,30 +61,21 @@ Breaking changes are marked **Breaking**. Versions before 0.6.0 are not recorded
   action that produced it. A removal names the action applied *at* a version; the action that
   produced the version is the one before. It also now says that pops and removals reuse and
   shift version numbers, where it said that versions count every action ever applied.
-- The documented cost of a removal. Removing an action that commutes with the
-  actions after it was said to take *O*(log *n*) applications; reconstructing the state the
-  action was applied to makes it linear in the distance to the end, and the bound is amortized
-  rather than per call because a removal also repairs the cache as a pop does. It is now given
-  as *O*(*m* + log *n*) amortized for *m* actions after the one removed, and *O*(*n*) in the
-  worst case.
+- The documented cost of a removal, which was said to take *O*(log *n*) applications for an
+  action that commutes with the actions after it. It is *O*(*m* + log *n*) amortized for *m*
+  actions after the one removed, and *O*(*n*) in the worst case.
+- The documented cost of a pop, which said that most pops apply nothing. It is *O*(log *n*)
+  amortized and *O*(*n*) in the worst case.
 - `Action::apply_batch` is no longer called with an empty slice, and the requirements on it and
   on `Action::apply` are now written down: applying an action must give a state that depends
-  only on the action and the state it is applied to, and must be safe to repeat, because the
-  history applies actions again whenever it rebuilds a state.
+  only on the action and the state it is applied to, and must be safe to repeat.
 - The documentation of the defaults for `Action`'s associated types, which promised them to
   builds that do not have the `associated_type_defaults` feature. The feature is now mentioned
   in the README.
-- The documented cost of a pop, which said that most pops replay nothing. That is true only of
-  a pop that undoes the push before it, and then only in a history of single pushes and pops; in
-  a run of pops most replay at least one action. The documentation now gives the bounds alone:
-  *O*(log *n*) amortized and *O*(*n*) in the worst case.
 - The description of what `forget_actions` bounds, in its documentation and the README. It is
   the number of actions left that is within a factor of what was asked for, not the number
   folded in, which can be none.
-- `pop_actions(0)` now does nothing. It used to rebuild whichever cache windows earlier pushes
-  had left empty, so a call that removed nothing could apply actions and, for a fallible action,
-  fail.
-- A removal and `pop_actions` no longer apply actions twice while rebuilding the cache.
-  The most recent state was replayed from the newest state the operation kept rather than from
-  the nearer ones it had just rebuilt, which doubled the applications of a removal with nothing
-  commuting and, for a bulk pop, added half again on average and nearly as much again at worst.
+- `pop_actions(0)` now does nothing. It could apply actions and, for a fallible action, fail.
+- A removal and `pop_actions` no longer apply actions twice. That doubled the applications of a
+  removal with nothing commuting and, for a bulk pop, added half again on average and nearly as
+  much again at worst.
