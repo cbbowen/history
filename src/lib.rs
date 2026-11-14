@@ -99,10 +99,15 @@ pub trait Action: Sized {
 
     #[cfg(feature = "associated_type_defaults")]
     #[doc = centralizer_doc!()]
-    type Centralizer<'a>: Centralizer<'a, Self> = NonCommutative;
+    type Centralizer<'a>: Centralizer<'a, Self>
+    where
+        Self: 'a,
+    = NonCommutative;
     #[cfg(not(feature = "associated_type_defaults"))]
     #[doc = centralizer_doc!()]
-    type Centralizer<'a>: Centralizer<'a, Self>;
+    type Centralizer<'a>: Centralizer<'a, Self>
+    where
+        Self: 'a;
 
     /// Applies this action to a state, producing a new state.
     ///
