@@ -26,9 +26,9 @@ This crate's error types report a value of this type as their [`source`](std::er
 
 macro_rules! centralizer_doc {
     () => {
-"Which other actions this one commutes with, which is what lets the `remove_action` family avoid replaying the actions after the one it removes.
+"Which other actions this one commutes with, and how to take this one back out of a state they have since been applied to. That is what lets the `remove_action` family correct the cached states after the action it removes rather than replay the actions that led to them.
 
-Defaults to [`NonCommutative`], which never reports that anything commutes: always sound, and never faster."
+Defaults to [`NonCommutative`], which never reports that anything commutes: always sound, and never cheaper."
     }
 }
 
@@ -76,22 +76,6 @@ pub trait Action: Sized {
         }
         Ok(state)
     }
-
-    /// Applies the inverse of this action to a given state in place.
-    ///
-    /// For all `previous_state`, `self.inverse(previous_state, state)` where `state` is
-    /// `self.apply(previous_state)` must leave `state` equivalent to `previous_state`. Observe that
-    /// if [`Self::Centralizer`] never reports that an action commutes, cloning `previous_state`
-    /// into `state` is always a correct implementation. However, history surgery can be made more
-    /// efficient with an implementation that only restores the portion of the state this action
-    /// actually affects.
-    ///
-    /// If [`Self::Centralizer`] *does* report that actions commute, this obligation is not
-    /// enough on its own: `state` is then a state some commuting actions further on, and
-    /// [`Centralizer`] documents the stronger property that must hold.
-    fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
-        state.clone_from(previous_state);
-    }
 }
 
 /// Identifies a specific version in the history.
@@ -120,25 +104,81 @@ impl From<Version> for usize {
     }
 }
 
-/// Represents the set of actions an action commutes with.
+/// Represents the set of actions an action commutes with, and takes that action back out of a
+/// state they have since been applied to.
+///
+/// This is what lets the `remove_action` family correct the cached states that follow the action
+/// it removes rather than replay the actions that led to them. The two halves cannot be
+/// implemented apart, which is why they share a trait: [`Self::commutes`] promises something
+/// about what [`Self::inverse`] does.
 ///
 /// To be precise, let `c` be `Centralizer::for_action(a)` and let `b_1, ..., b_k` be any actions
 /// with `c.commutes(b_i)` for every `i`. Write `bs(s)` for applying them in order to a state `s`.
-/// Then for all `s`, inverting `a` back out of the state reached by applying it and then them,
+/// Then for all `s`, taking `a` back out of the state reached by applying it and then them,
 ///
 /// ```text
 /// let mut state = bs(a.apply(s));
-/// a.inverse(&s, &mut state);
+/// c.inverse(&s, &mut state);
 /// ```
 ///
-/// *must* leave `state` equivalent to `bs(s)`. Note that `a.inverse` is passed the state from
+/// *must* leave `state` equivalent to `bs(s)`. Note that `inverse` is passed the state from
 /// before `a` was applied, not the one immediately preceding `state`; the two differ by exactly
 /// `b_1, ..., b_k`, which is what commuting has to make irrelevant. The single-action case
-/// `k = 1` is not sufficient: the `remove_action` family shifts an action past a whole run of
-/// commuting actions at once.
+/// `k = 1` is not sufficient: the `remove_action` family takes an action out from behind a whole
+/// run of commuting actions at once.
 ///
-/// False negative results will make the `remove_action` family of functions fall back to slower
-/// (but correct) implementations. False positive results will produce incorrect states.
+/// False negative results from `commutes` cost only time: the `remove_action` family replays the
+/// actions it could have skipped. False positive results will produce incorrect states.
+///
+/// # Example
+///
+/// Actions that each set one element of a vector commute when they set different elements, and
+/// taking one back out restores just the element it set.
+///
+/// ```
+/// use history::*;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct Set(usize, i32);
+///
+/// struct OtherIndices(usize);
+///
+/// impl<'a> Centralizer<'a, Set> for OtherIndices {
+///     fn for_action(action: &'a Set) -> Self {
+///         Self(action.0)
+///     }
+///
+///     fn commutes(&self, other: &Set) -> bool {
+///         self.0 != other.0
+///     }
+///
+///     fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+///         // Only this element. The others may have been set since, by actions that stay.
+///         state[self.0] = previous_state[self.0];
+///     }
+/// }
+///
+/// impl Action for Set {
+///     type State = Vec<i32>;
+///     type Context = ();
+///     type Error = std::convert::Infallible;
+///     type Centralizer<'a> = OtherIndices;
+///
+///     fn apply(&self, mut state: Vec<i32>, _: &mut ()) -> Result<Vec<i32>, Self::Error> {
+///         state[self.0] = self.1;
+///         Ok(state)
+///     }
+/// }
+///
+/// let mut history = History::new(vec![0, 0]);
+/// history.push_action(Set(0, 1));
+/// history.push_action(Set(1, 2));
+/// assert_eq!(*history.last_state(), vec![1, 2]);
+///
+/// // Taken out from behind `Set(1, 2)`, which is not applied again.
+/// assert_eq!(history.remove_action(0), Some(Set(0, 1)));
+/// assert_eq!(*history.last_state(), vec![0, 2]);
+/// ```
 pub trait Centralizer<'a, A: Action> {
     /// Returns the centralizer of `action`.
     fn for_action(action: &'a A) -> Self;
@@ -148,6 +188,18 @@ pub trait Centralizer<'a, A: Action> {
     /// Returning `false` is always sound; see the trait documentation for what returning `true`
     /// promises.
     fn commutes(&self, other: &A) -> bool;
+
+    /// Takes the action this centralizer was built for back out of `state`, in place.
+    ///
+    /// `previous_state` is the state the action was applied to, and `state` is what that became
+    /// once the action and then one or more actions that [`Self::commutes`] accepts had been
+    /// applied to it. Afterwards `state` must be equivalent to `previous_state` with only those
+    /// other actions applied; the trait documentation states this precisely. Restoring from
+    /// `previous_state` the part of the state the action affected is the usual way to do it.
+    ///
+    /// This is never called for a state that only the action itself has been applied to, so a
+    /// centralizer whose `commutes` never returns `true` is never asked.
+    fn inverse(&self, previous_state: &A::State, state: &mut A::State);
 }
 
 /// A centralizer for an action that might not commute with any other action.
@@ -157,8 +209,15 @@ impl<'a, A: Action> Centralizer<'a, A> for NonCommutative {
     fn for_action(_action: &'a A) -> Self {
         Self
     }
+
     fn commutes(&self, _other: &A) -> bool {
         false
+    }
+
+    // Never called, as nothing commutes, but restoring the whole state is what would be right:
+    // with no other action to preserve, the state before the action is the state without it.
+    fn inverse(&self, previous_state: &A::State, state: &mut A::State) {
+        state.clone_from(previous_state);
     }
 }
 
@@ -306,14 +365,8 @@ pub enum RemoveActionError<A: Action> {
     IndexForgotten(usize),
 
     /// Applying an action failed while rebuilding the cached states. The action to remove is
-    /// still in the history at `index`, which may differ from the requested index: the action
-    /// may have been shifted past actions it commutes with.
-    ActionFailed {
-        /// Where the action to remove now sits.
-        index: usize,
-        /// The error that applying an action produced.
-        error: A::Error,
-    },
+    /// still in the history, which is exactly as it was.
+    ActionFailed(A::Error),
 }
 
 impl<A: Action> std::fmt::Display for RemoveActionError<A> {
@@ -321,7 +374,7 @@ impl<A: Action> std::fmt::Display for RemoveActionError<A> {
         match self {
             Self::IndexOutOfRange(_) => f.write_str("action index out of range"),
             Self::IndexForgotten(_) => f.write_str("action index already forgotten"),
-            Self::ActionFailed { .. } => f.write_str("failed to apply action"),
+            Self::ActionFailed(_) => f.write_str("failed to apply action"),
         }
     }
 }
@@ -331,11 +384,7 @@ impl<A: Action> std::fmt::Debug for RemoveActionError<A> {
         match self {
             Self::IndexOutOfRange(index) => f.debug_tuple("IndexOutOfRange").field(index).finish(),
             Self::IndexForgotten(index) => f.debug_tuple("IndexForgotten").field(index).finish(),
-            Self::ActionFailed { index, error } => f
-                .debug_struct("ActionFailed")
-                .field("index", index)
-                .field("error", error)
-                .finish(),
+            Self::ActionFailed(error) => f.debug_tuple("ActionFailed").field(error).finish(),
         }
     }
 }
@@ -348,13 +397,7 @@ where
         match (self, other) {
             (Self::IndexOutOfRange(a), Self::IndexOutOfRange(b)) => a == b,
             (Self::IndexForgotten(a), Self::IndexForgotten(b)) => a == b,
-            (
-                Self::ActionFailed { index, error },
-                Self::ActionFailed {
-                    index: other_index,
-                    error: other_error,
-                },
-            ) => index == other_index && error == other_error,
+            (Self::ActionFailed(a), Self::ActionFailed(b)) => a == b,
             _ => false,
         }
     }
@@ -366,7 +409,7 @@ impl<A: Action> std::error::Error for RemoveActionError<A> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::IndexOutOfRange(_) | Self::IndexForgotten(_) => None,
-            Self::ActionFailed { error, .. } => Some(error),
+            Self::ActionFailed(error) => Some(error),
         }
     }
 }
@@ -564,6 +607,9 @@ macro_rules! remove_example {
 # impl<'a> Centralizer<'a, Set> for OtherIndices {
 #  fn for_action(action: &'a Set) -> Self { Self(action.0) }
 #  fn commutes(&self, other: &Set) -> bool { self.0 != other.0 }
+#  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
+#   state[self.0] = previous_state[self.0];
+#  }
 # }
 # impl Action for Set {
 #  type State = Vec<i32>;
@@ -574,9 +620,6 @@ macro_rules! remove_example {
 #   state[self.0] = self.1;
 #   Ok(state)
 #  }
-#  fn inverse(&self, previous_state: &Vec<i32>, state: &mut Vec<i32>) {
-#   state[self.0] = previous_state[self.0];
-#  }
 # }
 # let mut history = History::new(vec![0, 0]);
 ",
@@ -584,7 +627,7 @@ macro_rules! remove_example {
             "history.push_action(Set(0, 1));
 history.push_action(Set(1, 2));
 assert_eq!(*history.last_state(), vec![1, 2]);
-// `Set(0, 1)` commutes with `Set(1, 2)`, so this removal is cheap.
+// `Set(0, 1)` commutes with `Set(1, 2)`, so this removal applies nothing: see `Centralizer`.
 assert_eq!(",
             $call,
             ", ",
@@ -633,10 +676,17 @@ macro_rules! remove_complexity {
     () => {
 "# Time complexity
 
-Takes *O*(*n*) time, where *n* is the number of actions after `index`. The consecutive actions
-after `index` that the removed action commutes with are shifted past with only *O*(log *n*) state
-clones, inversions, and applications; the actions after the first non-commuting one are re-applied
-in full."
+Applies no action more than once: the actions after `index` and, to reach them, the actions
+between `index` and the cached state before it, of which there are fewer than three times as many.
+That is *O*(*n*) applications, where *n* is the number of actions after `index`, plus the cache
+repair a pop also performs, which is *O*(log *N*) amortized over the *N* actions the history holds
+but can be a large part of the history for a single call.
+
+The consecutive actions after `index` that the removed action commutes with are not replayed
+where a cached state lies beyond them. Each cached state among them is corrected instead, with one
+clone and one [`Centralizer::inverse`], and there are *O*(log *n*) of them. This saves a constant
+factor rather than improving the bound: the corrections start from the state the removed action
+was applied to, and reconstructing that is the replay from the cached state before `index`."
     };
 }
 
@@ -702,6 +752,22 @@ impl<A: Action> History<A> {
     fn action_range(&self, from: usize, to: usize) -> &[A] {
         let base = self.base();
         &self.actions[from - base..to - base]
+    }
+
+    // Applies the actions carrying the state at `from` to the state at `to`, which must both be
+    // versions this history still holds. Applies nothing, and so calls nothing, when they are the
+    // same version.
+    fn replay(
+        &self,
+        from: usize,
+        to: usize,
+        state: A::State,
+        context: &mut A::Context,
+    ) -> Result<A::State, A::Error> {
+        if from == to {
+            return Ok(state);
+        }
+        A::apply_batch(self.action_range(from, to), state, context)
     }
 
     /// Returns all the actions the history still holds, from oldest to newest.
@@ -807,6 +873,51 @@ impl<A: Action> History<A> {
         self.states.truncate(write);
     }
 
+    // The versions at which a cache holding states at the versions `cached` lacks one that a
+    // history running from `initial` to `new_len` needs, ascending: the midpoint of every window
+    // that holds none of them, then `new_len` itself. `cached` must include `initial` and nothing
+    // after `new_len`.
+    //
+    // A window is rebuilt at its midpoint so that the state survives another *O*(2^scale)
+    // operations in either direction before the window runs empty again. Going from the coarsest
+    // window to the finest is what makes the versions ascend, so that each state can be replayed
+    // from the one before it. The coarsest window always holds the initial state, so it is never
+    // rebuilt and the midpoint cannot underflow.
+    fn refill_targets(
+        cached: impl Iterator<Item = usize> + Clone,
+        initial: usize,
+        new_len: usize,
+    ) -> impl Iterator<Item = usize> {
+        // The most recent state must always be cached: `last_state` hands it out directly. It
+        // belongs to no window, and it comes last because there is no later version.
+        let last = (!cached.clone().any(|version| version == new_len)).then_some(new_len);
+        (0..Self::window_count(new_len - initial))
+            .rev()
+            .filter(move |scale| {
+                !cached
+                    .clone()
+                    .any(|version| (new_len - version) >> scale == 1)
+            })
+            .map(move |scale| new_len - ((3 << scale) >> 1))
+            .chain(last)
+    }
+
+    // The newest of `states` and `plan` at or before `version`, which is the state a replay to
+    // `version` has the least far to go from. There must be one.
+    fn nearest_state<'s>(
+        states: &'s [(Version, A::State)],
+        plan: &'s [(Version, A::State)],
+        version: usize,
+    ) -> (usize, &'s A::State) {
+        let (Version(from), state) = states
+            .iter()
+            .chain(plan)
+            .filter(|(Version(cached), _)| *cached <= version)
+            .max_by_key(|(cached, _)| *cached)
+            .expect(HAS_INITIAL_STATE);
+        (*from, state)
+    }
+
     // Returns the states that must be added to `states` for it to cache a history whose most
     // recent version is `new_len`, ascending by version. `replay` must carry a state from one
     // version of the *new* history to a later one.
@@ -819,48 +930,18 @@ impl<A: Action> History<A> {
         mut replay: impl FnMut(usize, usize, A::State, &mut A::Context) -> Result<A::State, A::Error>,
         context: &mut A::Context,
     ) -> Result<Vec<(Version, A::State)>, A::Error> {
-        let mut plan: Vec<(Version, A::State)> = Vec::new();
         // The oldest version the history holds, which the windows are counted off rather than off
         // `new_len`: the actions before it have been folded into the state cached there.
         let Version(initial) = states.first().expect(HAS_INITIAL_STATE).0;
+        let cached = states.iter().map(|(Version(version), _)| *version);
 
-        // Fill the windows from the coarsest to the finest so that each refill can replay from a
-        // state an earlier iteration already planned. The coarsest window always holds the
-        // initial state, so the body never runs for it and the midpoint below cannot underflow.
-        // Successive targets ascend, which is what leaves `plan` sorted without a pass at the end.
-        for scale in (0..Self::window_count(new_len - initial)).rev() {
-            let occupies =
-                |(Version(version), _): &(Version, A::State)| (new_len - *version) >> scale == 1;
-            // Only the states already cached can occupy a window: a planned state sits in the
-            // middle of a coarser one.
-            if states.iter().any(occupies) {
-                continue;
-            }
-            let target = new_len - ((3 << scale) >> 1);
-            let (Version(from), state) = states
-                .iter()
-                .chain(plan.iter())
-                .filter(|(Version(version), _)| *version <= target)
-                .max_by_key(|(version, _)| *version)
-                .expect(HAS_INITIAL_STATE);
-            let state = replay(*from, target, state.clone(), context)?;
+        let mut plan: Vec<(Version, A::State)> = Vec::new();
+        for target in Self::refill_targets(cached, initial, new_len) {
+            // From the nearest state there is, the ones planned so far included. The targets
+            // ascend, so no two replays overlap and no action is applied twice.
+            let (from, state) = Self::nearest_state(states, &plan, target);
+            let state = replay(from, target, state.clone(), context)?;
             plan.push((Version(target), state));
-        }
-
-        // The most recent state must always be cached: `last_state` hands it out directly. It is
-        // planned last because it belongs to no window and sits at no version any refill above
-        // replays from, so the loop neither sees it nor needs it -- and appending it keeps the
-        // plan ascending. It does need the loop, though: the finest window the loop refilled sits
-        // one action short of it, so replaying from the newest *kept* state instead would apply
-        // every action in between a second time.
-        if states.last().map(|(version, _)| *version) != Some(Version(new_len)) {
-            let kept = states.last().expect(HAS_INITIAL_STATE);
-            let (Version(from), state) = match plan.last() {
-                Some(planned) if planned.0 > kept.0 => planned,
-                _ => kept,
-            };
-            let state = replay(*from, new_len, state.clone(), context)?;
-            plan.push((Version(new_len), state));
         }
 
         debug_assert!(plan.windows(2).all(|pair| pair[0].0 < pair[1].0));
@@ -873,9 +954,10 @@ impl<A: Action> History<A> {
     fn install_refill(&mut self, keep: usize, plan: Vec<(Version, A::State)>) {
         self.states.truncate(keep);
         self.states.extend(plan);
-        // Both halves are sorted, but a plan entry can fall before a kept one: a window is
-        // refilled at its midpoint, and the kept states nearer the end sit in finer windows.
-        // Unstable is fine and avoids a scratch buffer -- versions are unique, so the order is
+        // A plan entry can fall before a kept one: a window is refilled at its midpoint, and the
+        // kept states nearer the end sit in finer windows. Nor does a removal's plan come in
+        // order, since it holds the states it corrected alongside the ones it replayed. Unstable
+        // is fine and avoids a scratch buffer -- versions are unique, so the order is
         // fully determined.
         self.states.sort_unstable_by_key(|(version, _)| *version);
         self.prune_cache();
@@ -1026,7 +1108,7 @@ impl<A: Action> History<A> {
         let plan = Self::plan_refill(
             &self.states[..keep],
             new_len,
-            |from, to, state, context| A::apply_batch(self.action_range(from, to), state, context),
+            |from, to, state, context| self.replay(from, to, state, context),
             context,
         )
         .map_err(PopError)?;
@@ -1118,93 +1200,13 @@ impl<A: Action> History<A> {
         actions
     }
 
-    /// Shifts the action at `index` past every consecutive later action it commutes with and
-    /// returns its new index.
-    ///
-    /// On error, the action sits at the index carried by the error, and the history is valid.
-    fn shift_late(
-        &mut self,
-        index: usize,
-        context: &mut A::Context,
-    ) -> Result<usize, RemoveActionError<A>> {
-        // Actions are addressed by version throughout, so every index into `self.actions` is
-        // offset by the actions the initial state has already absorbed.
-        let base = self.base();
-
-        // Determine how late the action can go: just past the last consecutive action it
-        // commutes with. The centralizer borrows the action, so it must be dropped before the
-        // reordering below.
-        let commuting = {
-            let centralizer = A::Centralizer::for_action(&self.actions[index - base]);
-            self.actions[index + 1 - base..]
-                .iter()
-                .take_while(|other| centralizer.commutes(other))
-                .count()
-        };
-        let target = index + commuting;
-        if target == index {
-            return Ok(index);
-        }
-
-        // Compute the state at version `index`, i.e. the state the action was applied to.
-        let state_at_index = match self.try_get_state_with(Version(index), context) {
-            Ok(state) => state,
-            // Unreachable: `index` is in range, so `Version(index)` is too.
-            Err(GetStateError::VersionOutOfRange(_)) => {
-                return Err(RemoveActionError::IndexOutOfRange(index));
-            }
-            Err(GetStateError::VersionForgotten(_)) => {
-                return Err(RemoveActionError::IndexForgotten(index));
-            }
-            Err(GetStateError::ActionFailed(error)) => {
-                return Err(RemoveActionError::ActionFailed { index, error });
-            }
-        };
-
-        // Shift the action toward `target`, one cached state at a time. Moving the action from
-        // `position` to a cached version `v` only invalidates the cached state at `v`: the old
-        // state there has the shifted action applied somewhere in its middle, `Action::inverse`
-        // shifts it out past the commuting actions (yielding the state at `v - 1` under the new
-        // order), and re-applying `actions[v]` (the action that moves to position `v - 1`) yields
-        // the state at `v`. Each iteration leaves the history fully consistent, so a failed
-        // `apply` merely leaves the action reordered.
-        let first_affected = self.states.partition_point(|(Version(v), _)| *v <= index);
-        let mut position = index;
-        for cache_index in first_affected..self.states.len() {
-            let (Version(cached_version), state) = &self.states[cache_index];
-            let cached_version = *cached_version;
-            if cached_version > target {
-                break;
-            }
-            let mut shifted = state.clone();
-            self.actions[position - base].inverse(&state_at_index, &mut shifted);
-            let shifted = match self.actions[cached_version - base].apply(shifted, context) {
-                Ok(state) => state,
-                Err(error) => {
-                    return Err(RemoveActionError::ActionFailed {
-                        index: position,
-                        error,
-                    });
-                }
-            };
-            self.actions[position - base..=cached_version - base].rotate_left(1);
-            self.states[cache_index].1 = shifted;
-            position = cached_version;
-        }
-
-        // Finish the shift past any remaining commuting actions before the next cached state.
-        self.actions[position - base..=target - base].rotate_left(1);
-        Ok(target)
-    }
-
-    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
-    /// the state at version `index` into the state at the following version). Later states are
-    /// rebuilt as if the removed action had never been applied.
+    /// Removes and returns the action at `index`, which is the action that transforms the state
+    /// at version `index` into the state at the following version. Later states are rebuilt as
+    /// if the removed action had never been applied, and every later version moves down by one.
     ///
     /// Returns an error if the index is out of range, names an action a fold has already
-    /// swallowed, or applying an action fails while rebuilding the cached states; in that case,
-    /// the action is not removed, but it may have been reordered past some of the actions it
-    /// commutes with — [`RemoveActionError::ActionFailed`] carries its current index.
+    /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
+    /// the history is unchanged.
     #[doc = remove_example!(
         context_setup!(),
         "history.try_remove_action_with(0, &mut context).unwrap()",
@@ -1222,43 +1224,108 @@ impl<A: Action> History<A> {
         if index >= last_version {
             return Err(RemoveActionError::IndexOutOfRange(index));
         }
-        if index < self.base() {
+        // Actions are addressed by version throughout, so every index into `self.actions` is
+        // offset by the actions the initial state has already absorbed.
+        let base = self.base();
+        if index < base {
             return Err(RemoveActionError::IndexForgotten(index));
         }
-
-        // Shift the action as late as it can go cheaply; only the actions after its new position
-        // need to be replayed.
-        let index = self.shift_late(index, context)?;
+        let new_len = last_version - 1;
 
         // Cached states at or before `index` survive the removal untouched; the ones after it
-        // describe a history that no longer exists and are rebuilt by replaying without the
-        // removed action. Every fallible action application happens before any mutation, so on
-        // error the action is still at `index`.
+        // describe a history that no longer exists. Everything that can fail happens while
+        // planning their replacements, before any mutation, so on error the history is unchanged.
         let keep = self
             .states
             .partition_point(|(Version(version), _)| *version <= index);
-        let plan = Self::plan_refill(
-            &self.states[..keep],
-            last_version - 1,
-            |from, to, state, context| {
-                // Version `v` of the shortened history is reached by the action at position `v`
-                // while before `index` and by the one at `v + 1` from `index` on, so a replay
-                // spans at most two runs of the actions as they stand now.
-                let split = index.clamp(from, to);
-                let state = A::apply_batch(self.action_range(from, split), state, context)?;
+        let plan = {
+            let (kept, stale) = self.states.split_at(keep);
+
+            // Version `v` of the shortened history is reached by the action at position `v`
+            // while before `index` and by the one at `v + 1` from `index` on, so a replay spans
+            // at most two runs of the actions as they stand now.
+            let replay_without = |from: usize, to: usize, state: A::State, context: &mut _| {
+                let state = self.replay(from, index.clamp(from, to), state, context)?;
                 let tail = from.max(index);
                 if tail < to {
-                    A::apply_batch(self.action_range(tail + 1, to + 1), state, context)
+                    self.replay(tail + 1, to + 1, state, context)
                 } else {
                     Ok(state)
                 }
-            },
-            context,
-        )
-        .map_err(|error| RemoveActionError::ActionFailed { index, error })?;
+            };
+
+            // A stale state need not be thrown away if every action between the removed one and
+            // it commutes with the removed one: the removed action can then be taken straight
+            // back out of it, which leaves the state one version earlier of the shortened
+            // history. The state directly after the removed action is the exception. Nothing
+            // lies in between to commute with, and taking the action out of it gives back the
+            // state the action was applied to, which every other inversion needs to begin with.
+            let centralizer = A::Centralizer::for_action(&self.actions[index - base]);
+            let commuting = self.actions[index + 1 - base..]
+                .iter()
+                .take_while(|other| centralizer.commutes(other))
+                .count();
+            let invertible = {
+                let start = stale.partition_point(|(Version(version), _)| *version <= index + 1);
+                let end = stale
+                    .partition_point(|(Version(version), _)| *version <= index + 1 + commuting);
+                &stale[start..end.max(start)]
+            };
+
+            // The versions the shortened history will have states for before any replay: the
+            // kept ones, the inverted ones, and the state at `index` itself, which the inversions
+            // need and which costs nothing more to keep.
+            let cached = kept
+                .iter()
+                .map(|(Version(version), _)| *version)
+                .chain((!invertible.is_empty()).then_some(index))
+                .chain(invertible.iter().map(|(Version(version), _)| *version - 1));
+
+            let mut plan: Vec<(Version, A::State)> = Vec::new();
+            let mut inverted = invertible.is_empty();
+            // The trailing `None` is there so that the inversions still happen when nothing
+            // after `index` needs replaying at all.
+            for target in Self::refill_targets(cached, base, new_len)
+                .map(Some)
+                .chain([None])
+            {
+                // Invert once the replays have reached `index`, and not before: the state at
+                // `index` is then replayed from the nearest state planned on the way there
+                // rather than from further back, and every later replay can start from an
+                // inverted state. That is what keeps commuting from ever costing an application.
+                if !inverted && target.is_none_or(|target| target > index) {
+                    inverted = true;
+                    let (from, state) = Self::nearest_state(kept, &plan, index);
+                    let rebuilt = if from == index {
+                        None
+                    } else {
+                        let state = replay_without(from, index, state.clone(), context)
+                            .map_err(RemoveActionError::ActionFailed)?;
+                        Some(state)
+                    };
+                    let previous_state = rebuilt.as_ref().unwrap_or(state);
+                    let corrected: Vec<_> = invertible
+                        .iter()
+                        .map(|(Version(version), state)| {
+                            let mut state = state.clone();
+                            centralizer.inverse(previous_state, &mut state);
+                            (Version(version - 1), state)
+                        })
+                        .collect();
+                    plan.extend(rebuilt.map(|state| (Version(index), state)));
+                    plan.extend(corrected);
+                }
+                let Some(target) = target else { break };
+                let (from, state) = Self::nearest_state(kept, &plan, target);
+                let state = replay_without(from, target, state.clone(), context)
+                    .map_err(RemoveActionError::ActionFailed)?;
+                plan.push((Version(target), state));
+            }
+            plan
+        };
 
         // All mutation happens below and is infallible.
-        let action = self.actions.remove(index - self.base());
+        let action = self.actions.remove(index - base);
         self.install_refill(keep, plan);
         Ok(action)
     }
@@ -1300,12 +1367,8 @@ impl<A: Action> History<A> {
         // The initial state is always cached, so the partition is never empty.
         let index = self.states.partition_point(|(v, _)| *v <= version) - 1;
         let (Version(cached), state) = &self.states[index];
-        A::apply_batch(
-            self.action_range(*cached, version.0),
-            state.clone(),
-            context,
-        )
-        .map_err(GetStateError::ActionFailed)
+        self.replay(*cached, version.0, state.clone(), context)
+            .map_err(GetStateError::ActionFailed)
     }
 
     /// Returns the versions of the cached states.
@@ -1450,9 +1513,9 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
             .unwrap_or_else(|error| match error.into_error() {})
     }
 
-    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
-    /// the state at version `index` into the state at the following version). Later states are
-    /// rebuilt as if the removed action had never been applied.
+    /// Removes and returns the action at `index`, which is the action that transforms the state
+    /// at version `index` into the state at the following version. Later states are rebuilt as
+    /// if the removed action had never been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
     /// action [`Self::forget_actions`] has already folded into the initial state.
@@ -1470,7 +1533,7 @@ impl<A: Action<Error = std::convert::Infallible>> History<A> {
             Err(RemoveActionError::IndexOutOfRange(_) | RemoveActionError::IndexForgotten(_)) => {
                 None
             }
-            Err(RemoveActionError::ActionFailed { error, .. }) => match error {},
+            Err(RemoveActionError::ActionFailed(error)) => match error {},
         }
     }
 
@@ -1542,14 +1605,13 @@ impl<A: Action<Context = ()>> History<A> {
         self.try_pop_actions_with(k, &mut ())
     }
 
-    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
-    /// the state at version `index` into the state at the following version). Later states are
-    /// rebuilt as if the removed action had never been applied.
+    /// Removes and returns the action at `index`, which is the action that transforms the state
+    /// at version `index` into the state at the following version. Later states are rebuilt as
+    /// if the removed action had never been applied, and every later version moves down by one.
     ///
     /// Returns an error if the index is out of range, names an action a fold has already
-    /// swallowed, or applying an action fails while rebuilding the cached states; in that case,
-    /// the action is not removed, but it may have been reordered past some of the actions it
-    /// commutes with — [`RemoveActionError::ActionFailed`] carries its current index.
+    /// swallowed, or applying an action fails while rebuilding the cached states. In every case,
+    /// the history is unchanged.
     #[doc = remove_example!(
         "",
         "history.try_remove_action(0).unwrap()",
@@ -1622,9 +1684,9 @@ impl<A: Action<Context = (), Error = std::convert::Infallible>> History<A> {
         self.pop_actions_with(k, &mut ())
     }
 
-    /// Removes and returns the action at `index` (the `index`th oldest action, which transforms
-    /// the state at version `index` into the state at the following version). Later states are
-    /// rebuilt as if the removed action had never been applied.
+    /// Removes and returns the action at `index`, which is the action that transforms the state
+    /// at version `index` into the state at the following version. Later states are rebuilt as
+    /// if the removed action had never been applied, and every later version moves down by one.
     ///
     /// Returns `None` and leaves the history unchanged if `index` is out of range or names an
     /// action [`Self::forget_actions`] has already folded into the initial state.
@@ -1661,6 +1723,7 @@ mod tests {
 
     use proptest::prelude::*;
     use proptest_derive::Arbitrary;
+    use std::cell::Cell;
     use std::convert::Infallible;
 
     #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
@@ -2042,137 +2105,440 @@ mod tests {
 
     const SLOT_COUNT: usize = 4;
 
-    /// An action which sets one of [`SLOT_COUNT`] slots; actions on distinct slots commute.
-    #[derive(Arbitrary, Clone, Copy, Debug, PartialEq, Eq)]
-    struct SetSlot {
-        slot: u8,
+    thread_local! {
+        /// How many [`Slots`] this thread has cloned, and how many actions it has taken back
+        /// out of one. A test that resets these before an operation sees only that operation.
+        static CLONES: Cell<usize> = const { Cell::new(0) };
+        static INVERSIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The state of a [`Mix`], which counts how often it is cloned.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct Slots([u64; SLOT_COUNT]);
+
+    impl Clone for Slots {
+        fn clone(&self) -> Self {
+            CLONES.set(CLONES.get() + 1);
+            Self(self.0)
+        }
+    }
+
+    /// The context of a [`Mix`]: how many applications there have been, and how many more
+    /// there may be before they start to fail.
+    #[derive(Debug)]
+    struct Meter {
+        applications: usize,
+        budget: usize,
+    }
+
+    impl Meter {
+        fn unlimited() -> Self {
+            Self::limited(usize::MAX)
+        }
+
+        fn limited(budget: usize) -> Self {
+            Self {
+                applications: 0,
+                budget,
+            }
+        }
+    }
+
+    /// The failure of a [`Mix`] applied on a spent [`Meter`].
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Exhausted;
+
+    impl std::fmt::Display for Exhausted {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the meter is spent")
+        }
+    }
+
+    impl std::error::Error for Exhausted {}
+
+    /// An action which folds a value into one of [`SLOT_COUNT`] slots. Folding, unlike
+    /// overwriting, makes a slot depend on every action that has reached it and on their order,
+    /// so an action that is applied twice, dropped, or moved past another on its slot shows in
+    /// the state. Actions on distinct slots commute, which the centralizer reports only when
+    /// `COMMUTES`: the two variants build identical histories and differ only in how much a
+    /// removal is told.
+    ///
+    /// Whether an application succeeds is up to the [`Meter`], not the action, so one that
+    /// succeeded when it was pushed can fail when it is replayed.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Mix<const COMMUTES: bool> {
+        slot: usize,
         value: u8,
     }
 
-    impl SetSlot {
-        fn slot(&self) -> usize {
-            usize::from(self.slot) % SLOT_COUNT
+    impl<const COMMUTES: bool> Mix<COMMUTES> {
+        fn strategy() -> impl Strategy<Value = Self> {
+            (0..SLOT_COUNT, any::<u8>()).prop_map(|(slot, value)| Self { slot, value })
         }
     }
 
-    /// The centralizer of a [`SetSlot`]: every action on a different slot.
-    struct OtherSlots(usize);
+    /// The centralizer of a [`Mix`]: every action on a different slot, if it admits to any.
+    struct OtherSlots<const COMMUTES: bool>(usize);
 
-    impl<'a> Centralizer<'a, SetSlot> for OtherSlots {
-        fn for_action(action: &'a SetSlot) -> Self {
-            Self(action.slot())
+    impl<'a, const COMMUTES: bool> Centralizer<'a, Mix<COMMUTES>> for OtherSlots<COMMUTES> {
+        fn for_action(action: &'a Mix<COMMUTES>) -> Self {
+            Self(action.slot)
         }
 
-        fn commutes(&self, other: &SetSlot) -> bool {
-            self.0 != other.slot()
+        fn commutes(&self, other: &Mix<COMMUTES>) -> bool {
+            COMMUTES && self.0 != other.slot
+        }
+
+        fn inverse(&self, previous_state: &Slots, state: &mut Slots) {
+            INVERSIONS.set(INVERSIONS.get() + 1);
+            state.0[self.0] = previous_state.0[self.0];
         }
     }
 
-    impl Action for SetSlot {
-        type State = [u8; SLOT_COUNT];
-        type Centralizer<'a> = OtherSlots;
+    impl<const COMMUTES: bool> Action for Mix<COMMUTES> {
+        type State = Slots;
+        type Context = Meter;
+        type Error = Exhausted;
+        type Centralizer<'a> = OtherSlots<COMMUTES>;
 
-        // Defaults.
-        type Context = ();
-        type Error = Infallible;
-
-        fn apply(
-            &self,
-            mut state: Self::State,
-            _: &mut Self::Context,
-        ) -> Result<Self::State, Self::Error> {
-            state[self.slot()] = self.value;
+        fn apply(&self, mut state: Slots, meter: &mut Meter) -> Result<Slots, Exhausted> {
+            meter.budget = meter.budget.checked_sub(1).ok_or(Exhausted)?;
+            meter.applications += 1;
+            let slot = &mut state.0[self.slot];
+            *slot = slot
+                .wrapping_mul(0x0100_0000_01b3)
+                .wrapping_add(u64::from(self.value) + 1);
             Ok(state)
         }
+    }
 
-        fn inverse(&self, previous_state: &Self::State, state: &mut Self::State) {
-            state[self.slot()] = previous_state[self.slot()];
+    /// Builds a history by pushing an action on each of `slots` in turn.
+    fn mixed_history<const COMMUTES: bool>(
+        slots: impl IntoIterator<Item = usize>,
+    ) -> History<Mix<COMMUTES>> {
+        let mut history = History::default();
+        for (i, slot) in slots.into_iter().enumerate() {
+            let value = (i % 251) as u8;
+            history
+                .try_push_action_with(Mix { slot, value }, &mut Meter::unlimited())
+                .unwrap();
         }
+        history
+    }
+
+    /// Panics unless every state `history` has cached -- and so every state it can hand out or
+    /// replay from -- is the one its actions produce from its initial state.
+    fn assert_cached_states_match_actions<const COMMUTES: bool>(history: &History<Mix<COMMUTES>>) {
+        let base = history.initial_version().index();
+        let mut state = history.initial_state().clone();
+        let mut cached = history.states.iter().peekable();
+        for offset in 0..=history.actions.len() {
+            if offset > 0 {
+                state = history.actions[offset - 1]
+                    .apply(state, &mut Meter::unlimited())
+                    .unwrap();
+            }
+            let version = Version(base + offset);
+            if let Some((_, cached)) = cached.next_if(|(cached, _)| *cached == version) {
+                assert_eq!(*cached, state, "the cached state at {version:?} is wrong");
+            }
+        }
+        assert_eq!(cached.next().map(|(version, _)| version), None);
+    }
+
+    /// Some ways of spreading `n` actions over the slots, from nothing commuting to everything
+    /// commuting with its neighbours.
+    fn slot_patterns(n: usize) -> Vec<Vec<usize>> {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut scattered = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % SLOT_COUNT as u64) as usize
+        };
+        vec![
+            vec![0; n],
+            (0..n).map(|i| i % 2).collect(),
+            (0..n).map(|i| i % SLOT_COUNT).collect(),
+            (0..n).map(|i| (i / 5) % SLOT_COUNT).collect(),
+            (0..n).map(|_| scattered()).collect(),
+        ]
+    }
+
+    /// Some histories with the actions of `slots` in them, built the same way whatever
+    /// `COMMUTES` is: by pushes alone, and with stretches popped and pushed again so that the
+    /// cache is no longer laid out as pushes alone leave it.
+    fn mixed_histories<const COMMUTES: bool>(slots: &[usize]) -> Vec<History<Mix<COMMUTES>>> {
+        let pushed = mixed_history(slots.iter().copied());
+        let n = slots.len();
+        let meter = &mut Meter::unlimited();
+
+        let mut bulk = pushed.clone();
+        let popped = bulk.try_pop_actions_with(n / 3, meter).unwrap();
+        for action in popped.into_iter().rev() {
+            bulk.try_push_action_with(action, meter).unwrap();
+        }
+
+        let mut singly = pushed.clone();
+        let mut popped = Vec::new();
+        for _ in 0..n / 2 {
+            popped.extend(singly.try_pop_action_with(meter).unwrap());
+        }
+        for action in popped.into_iter().rev() {
+            singly.try_push_action_with(action, meter).unwrap();
+        }
+
+        vec![pushed, bulk, singly]
     }
 
     proptest! {
         #[test]
         fn try_remove_action(
-            actions in prop::collection::vec(any::<SetSlot>(), 1..32),
+            actions in prop::collection::vec(Mix::<true>::strategy(), 1..200),
             index in any::<prop::sample::Index>(),
         ) {
+            let meter = &mut Meter::unlimited();
             let index = index.index(actions.len());
-            let mut history = History::new([0; SLOT_COUNT]);
+            let mut history = History::default();
             for action in &actions {
-                history.push_action(*action);
+                history.try_push_action_with(*action, meter).unwrap();
             }
 
             let mut expected_actions = actions.clone();
             let expected_removed = expected_actions.remove(index);
-            prop_assert_eq!(
-                history.try_remove_action_with(index, &mut ()).unwrap(),
-                expected_removed
-            );
-            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), expected_actions.clone());
+            prop_assert_eq!(history.try_remove_action_with(index, meter), Ok(expected_removed));
+            prop_assert_eq!(&history.actions, &expected_actions);
 
             // The history must be indistinguishable from one built from the remaining actions,
             // apart from its cache layout, which depends on how it reached its current length.
-            let mut expected = History::new([0; SLOT_COUNT]);
+            let mut expected = History::default();
             for action in &expected_actions {
-                expected.push_action(*action);
+                expected.try_push_action_with(*action, meter).unwrap();
             }
             for version in history.versions() {
-                prop_assert_eq!(history.get_state(version), expected.get_state(version));
+                prop_assert_eq!(
+                    history.try_get_state_with(version, meter),
+                    expected.try_get_state_with(version, meter)
+                );
             }
-            history.assert_cache_invariant();
+            assert_cached_states_match_actions(&history);
+            history.assert_every_window_occupied();
         }
 
         /// Removal addresses actions by version, so it must keep working once a fold has moved
         /// the actions out from under those numbers.
         #[test]
         fn try_remove_action_after_forgetting(
-            actions in prop::collection::vec(any::<SetSlot>(), 1..32),
+            actions in prop::collection::vec(Mix::<true>::strategy(), 1..200),
             forget in any::<prop::sample::Index>(),
             index in any::<prop::sample::Index>(),
         ) {
-            let mut history = History::new([0; SLOT_COUNT]);
+            let meter = &mut Meter::unlimited();
+            let mut history = History::default();
             for action in &actions {
-                history.push_action(*action);
+                history.try_push_action_with(*action, meter).unwrap();
             }
             // Never the whole history: there has to be an action left to remove, and folding
             // never takes more than it is asked for.
             let folded = history.forget_actions(forget.index(actions.len()));
             prop_assert!(history.actions().len() > 0);
 
-            let initial = *history.initial_state();
+            let initial = history.initial_state().clone();
             let base = history.initial_version().index();
             let index = base + index.index(history.actions().len());
 
-            let mut expected_actions = Vec::from_iter(history.actions().cloned());
+            let mut expected_actions = history.actions.clone();
             let expected_removed = expected_actions.remove(index - base);
-            prop_assert_eq!(
-                history.try_remove_action_with(index, &mut ()).unwrap(),
-                expected_removed
-            );
-            prop_assert_eq!(
-                Vec::from_iter(history.actions().cloned()),
-                expected_actions.clone()
-            );
+            prop_assert_eq!(history.try_remove_action_with(index, meter), Ok(expected_removed));
+            prop_assert_eq!(&history.actions, &expected_actions);
             prop_assert_eq!(folded.len() + expected_actions.len() + 1, actions.len());
 
             // Indistinguishable from a history that started life at the folded state and never
             // saw the removed action, apart from where its versions are counted from.
             let mut expected = History::new(initial);
             for action in &expected_actions {
-                expected.push_action(*action);
+                expected.try_push_action_with(*action, meter).unwrap();
             }
             for (version, reference) in history.versions().zip(expected.versions()) {
-                prop_assert_eq!(history.get_state(version), expected.get_state(reference));
+                prop_assert_eq!(
+                    history.try_get_state_with(version, meter),
+                    expected.try_get_state_with(reference, meter)
+                );
             }
-            history.assert_cache_invariant();
+            assert_cached_states_match_actions(&history);
+            history.assert_every_window_occupied();
         }
 
         #[test]
-        fn try_remove_action_out_of_range(mut history: History<TestAction>) {
-            let Version(index) = history.last_version();
-            let actions = Vec::from_iter(history.actions().cloned());
-            prop_assert_eq!(history.try_remove_action_with(index, &mut ()), Err(RemoveActionError::IndexOutOfRange(index)));
-            prop_assert_eq!(Vec::from_iter(history.actions().cloned()), actions);
+        fn try_remove_action_out_of_range(
+            mut history: History<TestAction>,
+            beyond in 0usize..4,
+        ) {
+            let before = history.clone();
+            for index in [history.last_version().index() + beyond, usize::MAX] {
+                prop_assert_eq!(
+                    history.try_remove_action(index),
+                    Err(RemoveActionError::IndexOutOfRange(index))
+                );
+                prop_assert_eq!(history.remove_action(index), None);
+            }
+            prop_assert_eq!(&history.actions, &before.actions);
+            prop_assert_eq!(&history.states, &before.states);
+        }
+    }
+
+    /// Removing an action with nothing commuting must leave exactly the history that pushing the
+    /// rest gives, from any index of any shape of history. This is the configuration every
+    /// implementation that does not write a centralizer of its own has.
+    #[test]
+    fn removing_an_action_with_nothing_commuting() {
+        for n in (1usize..=40).chain([64, 100]) {
+            let slots: Vec<usize> = (0..n).map(|i| i % SLOT_COUNT).collect();
+            for history in mixed_histories::<false>(&slots) {
+                for index in 0..n {
+                    let mut history = history.clone();
+                    let mut expected = history.actions.clone();
+                    let removed = expected.remove(index);
+
+                    INVERSIONS.set(0);
+                    assert_eq!(
+                        history.try_remove_action_with(index, &mut Meter::unlimited()),
+                        Ok(removed)
+                    );
+                    assert_eq!(INVERSIONS.get(), 0);
+                    assert_eq!(history.actions, expected);
+                    assert_eq!(history.last_version(), Version(n - 1));
+                    assert_cached_states_match_actions(&history);
+                    history.assert_every_window_occupied();
+                }
+            }
+        }
+    }
+
+    /// Reporting that actions commute is only ever a saving. Whatever the centralizer admits to,
+    /// a removal leaves the same states, and admitting to more never costs an application.
+    #[test]
+    fn commuting_never_costs_an_application() {
+        for n in (1usize..=40).chain([64, 100, 257]) {
+            for slots in slot_patterns(n) {
+                let commuting = mixed_histories::<true>(&slots);
+                let plain = mixed_histories::<false>(&slots);
+                for (commuting, plain) in commuting.into_iter().zip(plain) {
+                    for index in (0..n).step_by(n.div_ceil(64)) {
+                        let mut commuting = commuting.clone();
+                        let mut plain = plain.clone();
+                        let mut saved = Meter::unlimited();
+                        let mut spent = Meter::unlimited();
+
+                        let removed = commuting
+                            .try_remove_action_with(index, &mut saved)
+                            .expect("the meter is unlimited");
+                        let expected = plain
+                            .try_remove_action_with(index, &mut spent)
+                            .expect("the meter is unlimited");
+                        assert_eq!(
+                            (removed.slot, removed.value),
+                            (expected.slot, expected.value)
+                        );
+                        assert_eq!(commuting.last_state(), plain.last_state());
+                        assert_cached_states_match_actions(&commuting);
+                        assert_cached_states_match_actions(&plain);
+                        commuting.assert_every_window_occupied();
+                        plain.assert_every_window_occupied();
+                        assert!(
+                            saved.applications <= spent.applications,
+                            "removing {index} of {slots:?} applied {} actions where it applies \
+                             {} with nothing commuting",
+                            saved.applications,
+                            spent.applications,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// An action that commutes with everything after it is taken back out of the cached states
+    /// that follow it, so none of the actions after it is applied again. What a removal cannot
+    /// avoid is rebuilding the state the action was applied to, and repairing the cache before
+    /// it as a pop would: both replay only actions *before* the removed one, each at most once.
+    #[test]
+    fn removing_an_action_that_commutes_with_everything_after_it() {
+        for n in (1usize..=64).chain([100, 257, 1000]) {
+            let pushed = tallied_history::<true>(n);
+            let mut tally = vec![0; n];
+            for index in (0..n).step_by(n.div_ceil(64)) {
+                let mut history = pushed.clone();
+                tally.fill(0);
+                assert_eq!(
+                    history.remove_action_with(index, &mut tally),
+                    Some(Tallied(index))
+                );
+                assert!(
+                    tally[index..].iter().all(|&count| count == 0),
+                    "removing {index} of {n} applied an action from it on: {tally:?}"
+                );
+                assert!(
+                    tally[..index].iter().all(|&count| count <= 1),
+                    "removing {index} of {n} applied an earlier action twice: {tally:?}"
+                );
+                history.assert_every_window_occupied();
+            }
+
+            // The corrections themselves are logarithmic: a clone and an inversion for each
+            // cached state after the removed action, and there are at most two to a window.
+            let lone = (0..n).map(|i| usize::from(i > 0));
+            let mut history = mixed_history::<true>(lone);
+            let cached = history.states.len();
+            let mut meter = Meter::unlimited();
+            CLONES.set(0);
+            INVERSIONS.set(0);
+            history
+                .try_remove_action_with(0, &mut meter)
+                .expect("the meter is unlimited");
+            assert_eq!(meter.applications, 0, "removing the first of {n}");
+            assert!(INVERSIONS.get() <= cached, "removing the first of {n}");
+            assert!(CLONES.get() <= cached, "removing the first of {n}");
+            assert!(
+                cached <= 2 * History::<Mix<true>>::window_count(n) as usize + 1,
+                "{cached} states cached for {n} actions"
+            );
+            assert_cached_states_match_actions(&history);
+        }
+    }
+
+    /// A removal that fails must leave the history exactly as it was, wherever in its work the
+    /// failure comes: before the state the action was applied to has been rebuilt, between two
+    /// of the states it replays, or at the very last one.
+    #[test]
+    fn a_failed_removal_changes_nothing() {
+        for n in 1usize..=24 {
+            for slots in slot_patterns(n) {
+                for history in mixed_histories::<true>(&slots) {
+                    for index in 0..n {
+                        let mut needed = Meter::unlimited();
+                        let mut removed = history.clone();
+                        removed
+                            .try_remove_action_with(index, &mut needed)
+                            .expect("the meter is unlimited");
+
+                        for budget in 0..needed.applications {
+                            let mut failed = history.clone();
+                            assert_eq!(
+                                failed.try_remove_action_with(index, &mut Meter::limited(budget)),
+                                Err(RemoveActionError::ActionFailed(Exhausted))
+                            );
+                            assert_eq!(failed.actions, history.actions);
+                            assert_eq!(failed.states, history.states);
+                        }
+
+                        let mut exact = history.clone();
+                        let mut meter = Meter::limited(needed.applications);
+                        assert!(exact.try_remove_action_with(index, &mut meter).is_ok());
+                        assert_eq!(exact.states, removed.states);
+                    }
+                }
+            }
         }
     }
 
@@ -2227,20 +2593,45 @@ mod tests {
     }
 
     /// An action that tallies its applications by identity in the context, so that tests can
-    /// tell *which* actions an operation replayed and how often, not merely how many.
+    /// tell *which* actions an operation replayed and how often, not merely how many. It has no
+    /// state to get wrong, so it may claim to commute with everything, and does when `COMMUTES`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    struct Tallied(usize);
+    struct Tallied<const COMMUTES: bool>(usize);
 
-    impl Action for Tallied {
+    /// The centralizer of a [`Tallied`]: every action or none.
+    struct Indifferent<const COMMUTES: bool>;
+
+    impl<'a, const COMMUTES: bool> Centralizer<'a, Tallied<COMMUTES>> for Indifferent<COMMUTES> {
+        fn for_action(_: &'a Tallied<COMMUTES>) -> Self {
+            Self
+        }
+
+        fn commutes(&self, _: &Tallied<COMMUTES>) -> bool {
+            COMMUTES
+        }
+
+        fn inverse(&self, _: &(), _: &mut ()) {}
+    }
+
+    impl<const COMMUTES: bool> Action for Tallied<COMMUTES> {
         type State = ();
         type Context = Vec<u32>;
         type Error = Infallible;
-        type Centralizer<'a> = NonCommutative;
+        type Centralizer<'a> = Indifferent<COMMUTES>;
 
         fn apply(&self, _: (), tally: &mut Vec<u32>) -> Result<(), Infallible> {
             tally[self.0] += 1;
             Ok(())
         }
+    }
+
+    /// Builds a history by pushing `n` tallied actions, numbered in order.
+    fn tallied_history<const COMMUTES: bool>(n: usize) -> History<Tallied<COMMUTES>> {
+        let mut history = History::default();
+        for i in 0..n {
+            history.push_action_with(Tallied(i), &mut vec![0; n]);
+        }
+        history
     }
 
     /// No operation may apply an action twice to rebuild the cache: each state it needs is
@@ -2252,10 +2643,7 @@ mod tests {
         let sizes = (1usize..=64).chain([100, 257, 1000]);
         for n in sizes {
             let mut tally = vec![0; n];
-            let mut pushed = History::<Tallied>::default();
-            for i in 0..n {
-                pushed.push_action_with(Tallied(i), &mut tally);
-            }
+            let pushed = tallied_history::<false>(n);
             let stride = n.div_ceil(64);
 
             for index in (0..n).step_by(stride) {
@@ -2553,10 +2941,7 @@ mod tests {
             ["failed to apply action", "there is no action to apply"]
         );
 
-        let error = RemoveActionError::<Option<TestAction>>::ActionFailed {
-            index: 3,
-            error: NoAction,
-        };
+        let error = RemoveActionError::<Option<TestAction>>::ActionFailed(NoAction);
         assert_eq!(
             chain(&error),
             ["failed to apply action", "there is no action to apply"]
